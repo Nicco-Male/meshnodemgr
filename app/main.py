@@ -10,19 +10,23 @@ from pydantic import BaseModel, Field
 
 from app.db import (
     create_snapshot_record,
+    create_remote_read_record,
     get_snapshot,
     init_db,
     insert_snapshot_nodes,
     list_connections,
     list_managed_nodes,
     list_nodes,
+    list_remote_reads,
     list_snapshots,
     mark_node_as_managed,
     unmanage_node,
+    update_managed_node_remote_state,
     verify_snapshot,
+    verify_remote_read,
 )
 from app.services.discovery_service import discover_playbooks, discover_profiles
-from app.services.meshtastic_service import ConnectionProfile, run_local_backup, test_connection
+from app.services.meshtastic_service import ConnectionProfile, run_local_backup, run_remote_read_only, test_connection
 from app.services.serial_service import list_serial_ports
 
 app = FastAPI(title="PiAns Mesh Node Manager")
@@ -73,6 +77,14 @@ button{{background:#22303a}} pre{{white-space:pre-wrap;background:#0b0f12;paddin
 <section class='card'><h2>Nodi scoperti</h2><input id='node-search' placeholder='Cerca per id/nome/modello'>
 <div class='list'><ul id='node-list'></ul></div></section>
 <section class='card'><h2>Nodi gestiti</h2><div class='list'><ul id='managed-node-list'></ul></div></section>
+<section class='card'><h2>Remote Admin Read (solo lettura)</h2>
+<label>Node ID gestito</label><input id='remote-node-id' placeholder='!abcd1234'>
+<label>Timeout secondi</label><input id='remote-timeout' type='number' value='8'>
+<label>Retry</label><input id='remote-retries' type='number' value='2'>
+<button id='remote-read'>Request remote read</button>
+<button id='remote-verify'>Human verification</button>
+<pre id='remote-output'>Nessuna lettura remota.</pre>
+</section>
 </main><script>
 function body(){const t=document.getElementById('conn-type').value;return {type:t,serial_port:document.getElementById('serial-port').value||null,host:document.getElementById('tcp-host').value||null,port:Number(document.getElementById('tcp-port').value)||null};}
 async function loadNodes(){const res=await fetch('/api/nodes');const d=await res.json();window.__nodes=d.items||[];await loadManagedNodes();renderNodes();}
@@ -83,6 +95,8 @@ document.getElementById('node-list').addEventListener('click',async(e)=>{if(e.ta
 document.getElementById('node-search').addEventListener('input',renderNodes);
 document.getElementById('test-connection').addEventListener('click',async()=>{const o=document.getElementById('workflow-output');o.textContent='Testing...';const r=await fetch('/api/connections/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body())});o.textContent=JSON.stringify(await r.json(),null,2);});
 document.getElementById('run-backup').addEventListener('click',async()=>{const o=document.getElementById('workflow-output');o.textContent='Backup...';const r=await fetch('/api/backups/local',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body())});o.textContent=JSON.stringify(await r.json(),null,2);loadNodes();});
+document.getElementById('remote-read').addEventListener('click',async()=>{const o=document.getElementById('remote-output');const nodeId=(document.getElementById('remote-node-id').value||'').trim();if(!nodeId){o.textContent='Inserire node id';return;}o.textContent='Remote read in corso...';const r=await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/remote-read`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({connection:body(),timeout_seconds:Number(document.getElementById('remote-timeout').value)||8,retries:Number(document.getElementById('remote-retries').value)||2})});o.textContent=JSON.stringify(await r.json(),null,2);});
+document.getElementById('remote-verify').addEventListener('click',async()=>{const o=document.getElementById('remote-output');const parsed=JSON.parse(o.textContent||'{}');const id=parsed?.remote_read_id;if(!id){o.textContent='Nessun remote_read_id da verificare';return;}const r=await fetch(`/api/remote-reads/${id}/verify`,{method:'POST'});o.textContent=JSON.stringify(await r.json(),null,2);});
 loadNodes();</script></body></html>"""
     return template.replace("__HOST__", hostname).replace("__NOW__", now_iso).replace("__PORT_OPTIONS__", port_options)
 
@@ -142,6 +156,57 @@ def api_unmanage_node(node_id: str) -> dict[str, object]:
 def api_managed_nodes() -> dict[str, object]:
     items = list_managed_nodes()
     return {"count": len(items), "items": items}
+
+
+class RemoteReadRequest(BaseModel):
+    connection: ConnectionTestRequest
+    timeout_seconds: int = 8
+    retries: int = 2
+
+
+@app.post("/api/nodes/{node_id}/remote-read")
+def api_remote_read(node_id: str, payload: RemoteReadRequest) -> dict[str, object]:
+    result = run_remote_read_only(
+        node_id=node_id,
+        profile=ConnectionProfile(**payload.connection.model_dump()),
+        timeout_seconds=max(1, payload.timeout_seconds),
+        retries=max(1, payload.retries),
+    )
+    normalized = result["normalized"]
+    remote_read_id = create_remote_read_record(
+        {
+            "node_id": node_id,
+            "gateway_connection_type": normalized["gateway_connection_type"],
+            "gateway_connection_target": normalized["gateway_connection_target"],
+            "status": normalized["status"],
+            "attempts": result["attempts"],
+            "timeout_seconds": max(1, payload.timeout_seconds),
+            "error": normalized["errors"][0] if normalized["errors"] else None,
+            "raw_path": result["raw_path"],
+            "normalized_path": result["normalized_path"],
+        }
+    )
+    update_managed_node_remote_state(
+        node_id=node_id,
+        ok=normalized["status"] == "ok",
+        error=normalized["errors"][0] if normalized["errors"] else None,
+    )
+    return {"ok": normalized["status"] == "ok", "remote_read_id": remote_read_id, "result": result}
+
+
+@app.get("/api/remote-reads")
+def api_remote_reads(node_id: str | None = Query(default=None)) -> dict[str, object]:
+    items = list_remote_reads(node_id=node_id)
+    return {"count": len(items), "items": items}
+
+
+@app.post("/api/remote-reads/{remote_read_id}/verify")
+def api_verify_remote_read(remote_read_id: int) -> dict[str, object]:
+    if not verify_remote_read(remote_read_id):
+        raise HTTPException(status_code=404, detail="remote_read_not_found")
+    items = list_remote_reads()
+    selected = next((i for i in items if i["id"] == remote_read_id), None)
+    return {"ok": True, "remote_read": selected}
 
 
 @app.get("/api/snapshots")
