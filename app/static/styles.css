@@ -9,3 +9,5 @@ button{cursor:pointer;background:#1f3134;font-weight:600}button.primary{border-c
 .stat{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)}.stat:last-child{border-bottom:0}.badge{display:inline-flex;padding:2px 8px;border-radius:999px;font-size:.75rem;font-weight:700;border:1px solid var(--line)}.badge-ok{color:#7dffb1;border-color:#2c8f55;background:var(--accent-dim)}.badge-error{color:#ff9999;border-color:#9b3030}
 .list{display:grid;gap:8px;max-height:380px;overflow:auto}.node{border:1px solid var(--line);border-radius:10px;padding:10px;background:#0f181a}.node-top{display:flex;justify-content:space-between;gap:8px}.empty{text-align:center;padding:12px;color:var(--muted);border:1px dashed var(--line);border-radius:10px}
 @media (max-width:900px){.span-8,.span-6,.span-4{grid-column:span 12}}
+
+.hidden{display:none !important;}
