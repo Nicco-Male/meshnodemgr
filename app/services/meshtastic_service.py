@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +18,10 @@ class ConnectionProfile:
     serial_port: str | None = None
     host: str | None = None
     port: int | None = None
+
+
+def build_api_error(error: str, details: str, hint: str) -> dict[str, Any]:
+    return {"ok": False, "error": error, "details": details, "hint": hint}
 
 
 def _safe_json(value: Any) -> Any:
@@ -38,158 +44,129 @@ def _safe_json(value: Any) -> Any:
     return str(value)
 
 
+def _safe_close(iface: Any) -> str | None:
+    if iface is None:
+        return None
+    try:
+        iface.close()
+    except AttributeError as exc:
+        return str(exc)
+    except Exception:
+        return None
+    return None
+
+
 def _connect(profile: ConnectionProfile):
     if profile.type == "tcp":
+        if not profile.host or not profile.port:
+            raise ValueError("Missing TCP host or port")
         from meshtastic.tcp_interface import TCPInterface
 
         return TCPInterface(hostname=profile.host, portNumber=profile.port)
-    from meshtastic.serial_interface import SerialInterface
+    if profile.type == "serial":
+        if not profile.serial_port:
+            raise ValueError("Serial port is required for serial connections")
+        from meshtastic.serial_interface import SerialInterface
 
-    return SerialInterface(devPath=profile.serial_port)
+        return SerialInterface(devPath=profile.serial_port)
+    raise ValueError("Unsupported connection type")
+
+
+def _normalize_source(local_node: dict[str, Any] | None) -> dict[str, Any]:
+    local_node = local_node or {}
+    user = local_node.get("user") if isinstance(local_node.get("user"), dict) else {}
+    node_id = user.get("id") or local_node.get("node_id")
+    long_name = user.get("longName") or local_node.get("long_name") or local_node.get("name")
+    short_name = user.get("shortName") or local_node.get("short_name")
+    hw_model = user.get("hwModel") or local_node.get("hw_model")
+    node_num = local_node.get("num") or local_node.get("node_num")
+    label = " - ".join([p for p in [short_name, long_name] if p]) or long_name or short_name or str(node_id or node_num or "unknown-source")
+    return {
+        "source_node_id": node_id,
+        "source_node_num": node_num,
+        "source_node_long_name": long_name,
+        "source_node_short_name": short_name,
+        "source_node_hw_model": hw_model,
+        "source_node_label": label,
+    }
+
+
+def _slug(text: str, max_len: int = 80) -> str:
+    n = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    n = re.sub(r"[^A-Za-z0-9_-]+", "_", n).strip("_-")
+    return (n[:max_len] or "unknown-source")
 
 
 def test_connection(profile: ConnectionProfile) -> dict[str, Any]:
     if profile.type == "serial":
         ports = list_serial_ports()
         if not profile.serial_port:
-            return {"ok": False, "error": "missing_serial_port", "available_ports": ports}
+            return build_api_error("Serial port is required", "missing serial port", "Select a serial port from the list.") | {"available_ports": ports}
         if profile.serial_port not in ports:
-            return {"ok": False, "error": "serial_port_not_found", "available_ports": ports}
-    if profile.type == "tcp" and (not profile.host or not profile.port):
-        return {"ok": False, "error": "missing_tcp_host_or_port"}
-
+            return build_api_error("Serial port not found", profile.serial_port, "Refresh ports and pick a valid one.") | {"available_ports": ports}
     iface = None
     try:
         iface = _connect(profile)
         target = profile.serial_port if profile.type == "serial" else f"{profile.host}:{profile.port}"
         return {"ok": True, "type": profile.type, "target": target}
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        return build_api_error("Connection failed", str(exc), "Check connection settings and device availability.")
     finally:
-        if iface is not None:
-            try:
-                iface.close()
-            except Exception:
-                pass
+        _safe_close(iface)
 
 
 def _normalize_nodes(raw_nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
+    out = []
     for node in raw_nodes:
         user = node.get("user", {}) if isinstance(node, dict) else {}
         position = node.get("position", {}) if isinstance(node, dict) else {}
-        out.append(
-            {
-                "node_id": node.get("id") or node.get("node_id") or user.get("id"),
-                "node_num": node.get("num") or node.get("node_num"),
-                "long_name": user.get("longName") or node.get("long_name"),
-                "short_name": user.get("shortName") or node.get("short_name"),
-                "hw_model": user.get("hwModel") or node.get("hw_model"),
-                "last_heard": node.get("lastHeard") or node.get("last_heard") or position.get("time"),
-                "role": user.get("role") or node.get("role"),
-                "snr": node.get("snr"),
-                "raw": _safe_json(node),
-            }
-        )
+        out.append({"node_id": node.get("id") or node.get("node_id") or user.get("id"), "node_num": node.get("num") or node.get("node_num"), "long_name": user.get("longName") or node.get("long_name"), "short_name": user.get("shortName") or node.get("short_name"), "hw_model": user.get("hwModel") or node.get("hw_model"), "last_heard": node.get("lastHeard") or node.get("last_heard") or position.get("time"), "role": user.get("role") or node.get("role"), "snr": node.get("snr"), "raw": _safe_json(node)})
     return out
 
 
 def _read_all(profile: ConnectionProfile) -> dict[str, Any]:
+    iface = None
+    warnings: list[str] = []
     iface = _connect(profile)
     try:
         local_node = _safe_json(getattr(iface, "localNode", None))
         local_info = _safe_json(getattr(iface, "getMyNodeInfo", lambda: None)())
-        config = _safe_json(getattr(getattr(iface, "localNode", None), "localConfig", None))
-        channels = _safe_json(getattr(getattr(iface, "localNode", None), "channels", None))
-        nodes_obj = _safe_json(getattr(iface, "nodes", {}))
-        nodes_raw = list(nodes_obj.values()) if isinstance(nodes_obj, dict) else (nodes_obj if isinstance(nodes_obj, list) else [])
-        return {
-            "local_info": local_info,
-            "local_node": local_node,
-            "config_raw": config,
-            "channels_raw": channels,
-            "nodes_raw": _safe_json(nodes_raw),
-            "normalized_nodes": _normalize_nodes(nodes_raw),
-        }
+        nodes_snapshot = dict(getattr(iface, "nodes", {}) or {})
+        nodes_raw = [_safe_json(v) for v in nodes_snapshot.values()]
+        local_obj = getattr(iface, "localNode", None)
+        channels = _safe_json(getattr(local_obj, "channels", None))
+        config = _safe_json({"localConfig": getattr(local_obj, "localConfig", None), "moduleConfig": getattr(local_obj, "moduleConfig", None)})
+        metadata = _safe_json({"myInfo": getattr(iface, "myInfo", None), "metadata": getattr(iface, "metadata", None)})
+        return {"local_info": local_info, "local_node": local_node, "config_raw": config, "channels_raw": channels, "metadata": metadata, "nodes_raw": nodes_raw, "normalized_nodes": _normalize_nodes(nodes_raw), "warnings": warnings}
     finally:
-        iface.close()
+        close_err = _safe_close(iface)
+        if close_err:
+            warnings.append(f"close_warning: {close_err}")
 
 
 def run_local_backup(profile: ConnectionProfile) -> dict[str, Any]:
     now = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    backup_dir = Path("data") / "backups" / f"{now}-local"
+    read = _read_all(profile)
+    source = _normalize_source(_safe_json(read.get("local_info") or read.get("local_node") or {}))
+    folder_name = f"{now}-{_slug(source.get('source_node_short_name') or '')}-{_slug(source.get('source_node_long_name') or '')}".strip("-")
+    backup_dir = Path("data") / "backups" / (folder_name or f"{now}-unknown-source")
     backup_dir.mkdir(parents=True, exist_ok=True)
     errors: list[str] = []
-
-    try:
-        read = _read_all(profile)
-        status = "ok"
-    except Exception as exc:
-        read = {"local_info": None, "local_node": None, "config_raw": None, "channels_raw": None, "nodes_raw": [], "normalized_nodes": []}
-        errors.append(str(exc))
-        status = "failed"
-
-    metadata = {
-        "timestamp": now,
-        "connection": _safe_json(profile.__dict__),
-        "status": status,
-        "errors": errors,
-    }
-    normalized = {
-        "snapshot_time": now,
-        "connection_type": profile.type,
-        "connection_target": profile.serial_port if profile.type == "serial" else f"{profile.host}:{profile.port}",
-        "local_node": _safe_json(read.get("local_info") or read.get("local_node") or {}),
-        "node_count": len(read["normalized_nodes"]),
-        "nodes": read["normalized_nodes"],
-        "status": status,
-        "errors": errors,
-    }
-    (backup_dir / "local_info.json").write_text(json.dumps(read["local_info"], indent=2, ensure_ascii=False), encoding="utf-8")
-    (backup_dir / "config_raw.json").write_text(json.dumps(read["config_raw"], indent=2, ensure_ascii=False), encoding="utf-8")
-    (backup_dir / "channels_raw.json").write_text(json.dumps(read["channels_raw"], indent=2, ensure_ascii=False), encoding="utf-8")
-    (backup_dir / "nodes_raw.json").write_text(json.dumps(read["nodes_raw"], indent=2, ensure_ascii=False), encoding="utf-8")
-    (backup_dir / "normalized.json").write_text(json.dumps(normalized, indent=2, ensure_ascii=False), encoding="utf-8")
-    (backup_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+    status = "partial" if read.get("warnings") else "ok"
+    normalized = {"snapshot_time": now, "connection_type": profile.type, "connection_target": profile.serial_port if profile.type == "serial" else f"{profile.host}:{profile.port}", "source_node": source, "local_node": _safe_json(read.get("local_info") or read.get("local_node") or {}), "node_count": len(read["normalized_nodes"]), "nodes": read["normalized_nodes"], "status": status, "errors": errors, "warnings": read.get("warnings", [])}
+    metadata = {"timestamp": now, "connection": _safe_json(profile.__dict__), "status": status, "errors": errors, "warnings": read.get("warnings", [])}
+    for filename, payload in {"local_info.json": read["local_info"], "config_raw.json": read["config_raw"], "channels_raw.json": read["channels_raw"], "nodes_raw.json": read["nodes_raw"], "metadata.json": metadata, "normalized.json": normalized}.items():
+        (backup_dir / filename).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return {"normalized": normalized, "backup_dir": str(backup_dir), "raw_path": str(backup_dir / "metadata.json"), "normalized_path": str(backup_dir / "normalized.json")}
 
 
 def read_local_node(profile: ConnectionProfile) -> dict[str, Any]:
-    return _read_all(profile)
+    read = _read_all(profile)
+    source = _normalize_source(_safe_json(read.get("local_info") or read.get("local_node") or {}))
+    return {"ok": True, "source_node": source, "metadata": read.get("metadata") or {}, "config_summary": {"has_channels": bool(read.get("channels_raw")), "node_count": len(read.get("normalized_nodes", []))}}
 
 
 def read_discovered_nodes(profile: ConnectionProfile) -> dict[str, Any]:
     read = _read_all(profile)
-    return {"nodes": read["normalized_nodes"], "nodes_raw": read["nodes_raw"]}
-
-
-def run_remote_read_only(node_id: str, profile: ConnectionProfile, timeout_seconds: int = 8, retries: int = 2) -> dict[str, Any]:
-    connection_test = test_connection(profile)
-    now = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    attempts: list[dict[str, Any]] = []
-
-    if not connection_test.get("ok"):
-        final_error = str(connection_test.get("error", "connection_unavailable"))
-        remote_config = None
-    else:
-        final_error = "unknown_error"
-        remote_config = None
-        for idx in range(1, max(retries, 1) + 1):
-            result = run_meshtastic_remote_read(node_id=node_id, port=profile.serial_port or "", timeout_seconds=timeout_seconds)
-            attempts.append({"attempt": idx, "ok": result.ok, "error": result.error, "returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr})
-            if result.ok:
-                final_error = ""
-                remote_config = result.info if result.info else {"raw_stdout": result.stdout}
-                break
-            final_error = str(result.error or "command_failed")
-
-    raw_payload = {"timestamp": now, "node_id": node_id, "gateway": profile.__dict__, "attempts": attempts, "error": final_error or None, "remote_config": remote_config}
-    normalized = {"snapshot_time": now, "node_id": node_id, "gateway_connection_type": profile.type, "gateway_connection_target": connection_test.get("target") or "unavailable", "status": "ok" if remote_config is not None else "failed", "verified": False, "errors": [] if remote_config is not None else [final_error], "remote_config_summary": {"key_count": len(remote_config.keys()) if isinstance(remote_config, dict) else 0, "keys": sorted(remote_config.keys())[:20] if isinstance(remote_config, dict) else []} if remote_config is not None else None}
-    backups_dir = Path("data") / "backups"
-    backups_dir.mkdir(parents=True, exist_ok=True)
-    base_filename = f"remote_read_{node_id}_{now}_{profile.type}"
-    raw_path = backups_dir / f"{base_filename}_raw.json"
-    normalized_path = backups_dir / f"{base_filename}_normalized.json"
-    raw_path.write_text(json.dumps(raw_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    normalized_path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"raw": raw_payload, "normalized": normalized, "raw_path": str(raw_path), "normalized_path": str(normalized_path), "attempts": len(attempts)}
+    source = _normalize_source(_safe_json(read.get("local_info") or read.get("local_node") or {}))
+    return {"ok": True, "source_node": source, "node_count": len(read["normalized_nodes"]), "nodes": read["normalized_nodes"], "nodes_raw": read["nodes_raw"]}

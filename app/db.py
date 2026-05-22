@@ -53,6 +53,12 @@ def init_db() -> Path:
                 node_count INTEGER NOT NULL DEFAULT 0,
                 verified INTEGER NOT NULL DEFAULT 0,
                 verified_at TEXT,
+                verification_note TEXT,
+                rejected INTEGER NOT NULL DEFAULT 0,
+                rejected_at TEXT,
+                rejected_reason TEXT,
+                source_node_short_name TEXT,
+                source_node_hw_model TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -110,6 +116,12 @@ def init_db() -> Path:
                 normalized_path TEXT NOT NULL,
                 verified INTEGER NOT NULL DEFAULT 0,
                 verified_at TEXT,
+                verification_note TEXT,
+                rejected INTEGER NOT NULL DEFAULT 0,
+                rejected_at TEXT,
+                rejected_reason TEXT,
+                source_node_short_name TEXT,
+                source_node_hw_model TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -151,8 +163,8 @@ def create_snapshot_record(payload: dict[str, Any]) -> int:
             """
             INSERT INTO snapshots (
                 connection_type, connection_target, status, raw_path, normalized_path,
-                local_node_id, local_node_name, node_count, verified
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                local_node_id, local_node_name, node_count, verified, source_node_short_name, source_node_hw_model
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
             (
                 payload["connection_type"],
@@ -163,6 +175,8 @@ def create_snapshot_record(payload: dict[str, Any]) -> int:
                 payload.get("local_node_id"),
                 payload.get("local_node_name"),
                 payload.get("node_count", 0),
+                payload.get("source_node_short_name"),
+                payload.get("source_node_hw_model"),
             ),
         )
         snapshot_id = int(cur.lastrowid)
@@ -300,7 +314,8 @@ def list_snapshots() -> list[dict[str, Any]]:
             """
             SELECT id, connection_type, connection_target, status, raw_path,
                    normalized_path, local_node_id, local_node_name, node_count,
-                   verified, verified_at, created_at
+                   verified, verified_at, verification_note, rejected, rejected_at, rejected_reason,
+                   source_node_short_name, source_node_hw_model, created_at
             FROM snapshots
             ORDER BY id DESC
             """
@@ -315,7 +330,8 @@ def get_snapshot(snapshot_id: int) -> dict[str, Any] | None:
             """
             SELECT id, connection_type, connection_target, status, raw_path,
                    normalized_path, local_node_id, local_node_name, node_count,
-                   verified, verified_at, created_at
+                   verified, verified_at, verification_note, rejected, rejected_at, rejected_reason,
+                   source_node_short_name, source_node_hw_model, created_at
             FROM snapshots WHERE id = ?
             """,
             (snapshot_id,),
@@ -418,3 +434,26 @@ def update_managed_node_remote_state(node_id: str, ok: bool, error: str | None =
             (state, reason, error, node_id),
         )
         conn.commit()
+
+def ensure_snapshot_columns() -> None:
+    columns = {
+        "verification_note": "TEXT",
+        "rejected": "INTEGER NOT NULL DEFAULT 0",
+        "rejected_at": "TEXT",
+        "rejected_reason": "TEXT",
+        "source_node_short_name": "TEXT",
+        "source_node_hw_model": "TEXT",
+    }
+    with sqlite3.connect(DB_PATH) as conn:
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(snapshots)").fetchall()}
+        for col, ddl in columns.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE snapshots ADD COLUMN {col} {ddl}")
+        conn.commit()
+
+
+def reject_snapshot(snapshot_id: int, reason: str | None = None) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("UPDATE snapshots SET rejected = 1, rejected_at = CURRENT_TIMESTAMP, rejected_reason = ? WHERE id = ?", (reason, snapshot_id))
+        conn.commit()
+    return cur.rowcount > 0
