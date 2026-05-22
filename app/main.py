@@ -45,7 +45,57 @@ def on_startup() -> None:
 @app.get("/")
 def index() -> HTMLResponse:
     hostname = socket.gethostname(); ports = list_serial_ports()
-    return HTMLResponse(f"<html><body><h1>MeshNodeMgr</h1><div>{hostname}</div><script src='/static/app.js'></script></body></html>")
+    return HTMLResponse(_render_index_html(hostname=hostname, ports=ports, now_iso=datetime.now().isoformat(timespec="seconds")))
+
+
+def _render_index_html(hostname: str, ports: list[str], now_iso: str) -> str:
+    port_options = "".join(f"<option value='{p}'>{p}</option>" for p in ports)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PiAns Mesh Node Manager</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="container">
+    <header class="header">
+      <div><h1>PiAns Mesh Node Manager</h1><div class="muted">Meshtastic dashboard</div></div>
+      <div class="muted">{hostname} · {now_iso}</div>
+    </header>
+
+    <section class="grid">
+      <article class="card span-4"><h2>Connection status</h2><div class="stat"><span>Detected serial ports</span><strong>{len(ports)}</strong></div><div id="connection-status" class="status-box">Ready.</div></article>
+      <article class="card span-4"><h2>Local node backup</h2><div class="stat"><span>Discovered nodes</span><strong id="count-nodes">0</strong></div><div id="backup-status" class="status-box">No backup running.</div><div id="local-node-summary" class="muted"></div></article>
+      <article class="card span-4"><h2>Snapshots / verification</h2><div id="snap-state"></div></article>
+
+      <article class="card span-6">
+        <h2>Connection panel</h2>
+        <label>Connection type</label><select id="conn-type"><option value="serial">serial</option><option value="tcp">tcp</option></select>
+        <div id="serial-group"><label>Serial port</label><select id="serial-port"><option value="">Select serial port</option>{port_options}</select></div>
+        <div id="tcp-host-group" class="hidden"><label>TCP host</label><input id="tcp-host" placeholder="192.168.1.50"></div>
+        <div id="tcp-port-group" class="hidden"><label>TCP port</label><input id="tcp-port" value="4403"></div>
+        <div class="actions"><button id="test-connection">Test connection</button><button id="read-local">Read local node</button><button id="read-discovered">Read discovered nodes</button><button id="run-backup" class="primary">Run full local backup</button></div>
+      </article>
+
+      <article class="card span-6">
+        <h2>Discovered nodes</h2>
+        <label>Search</label><input id="node-search" placeholder="Search by id, name, model">
+        <div class="list" id="node-list"></div>
+      </article>
+
+      <article class="card span-12"><h2>Management state</h2><p class="muted">Use Manage/Unmanage on discovered nodes to update state.</p></article>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>"""
+
+
+@app.get('/api/status')
+def api_status():
+    return {"ok": True, "service": "meshnodemgr", "hostname": socket.gethostname()}
 
 @app.post('/api/connections/test')
 def api_test_connection(payload: ConnectionTestRequest):
