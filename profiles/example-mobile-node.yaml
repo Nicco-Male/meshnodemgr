@@ -1,0 +1,11 @@
+name: example-mobile-node
+description: Example profile for a portable Meshtastic node.
+
+config:
+  device:
+    role: CLIENT
+  position:
+    fixed_position: false
+    position_broadcast_secs: 900
+  lora:
+    hop_limit: 3

@@ -1,0 +1,9 @@
+meshtastic
+fastapi
+uvicorn
+pydantic
+pyyaml
+jinja2
+python-multipart
+aiosqlite
+pyserial

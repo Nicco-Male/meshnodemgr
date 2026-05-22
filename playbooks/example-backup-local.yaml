@@ -1,0 +1,10 @@
+name: backup-local-node
+description: Backup the local USB-connected Meshtastic node.
+
+targets:
+  - local
+
+tasks:
+  - name: detect_serial_port
+  - name: read_node_info
+  - name: save_backup
