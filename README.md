@@ -11,12 +11,15 @@ Goal: provide an Ansible-like configuration manager for Meshtastic nodes.
 - Serial detection isolated in `app/services/serial_service.py`.
 - Lightweight SQLite initialization in `app/db.py` with `inventory` table creation.
 - Runtime database stored under `data/` (git-ignored).
+- YAML discovery for profiles/playbooks validates structure and reports issues.
 
 ## API endpoints
 
 - `GET /api/status`
 - `GET /api/serial/ports`
 - `GET /api/inventory`
+- `GET /api/profiles`
+- `GET /api/playbooks`
 
 ## Run manually
 
