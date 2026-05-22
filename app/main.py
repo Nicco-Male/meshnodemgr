@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app.db import create_snapshot_record, ensure_snapshot_columns, get_snapshot, init_db, insert_snapshot_nodes, list_nodes, list_snapshots, reject_snapshot, verify_snapshot
+from app.db import create_snapshot_record, delete_snapshot, delete_snapshots_failed_or_empty, delete_snapshots_unverified, ensure_snapshot_columns, get_snapshot, init_db, insert_snapshot_nodes, list_nodes, list_snapshots, reject_snapshot, verify_snapshot
 from app.services.serial_service import list_serial_ports
 from app.services.meshtastic_service import ConnectionProfile, build_api_error, read_discovered_nodes, read_local_node, run_local_backup, test_connection
 
@@ -27,12 +27,10 @@ class VerifyPayload(BaseModel):
     note: str | None = None
 
 class CleanupPayload(BaseModel):
-    delete_failed: bool = True
-    delete_empty_partial: bool = True
-    delete_old_format: bool = False
-    delete_orphans: bool = True
+    mode: str = Field(default="preview", pattern="^(preview|single|unverified|failed_or_empty|older_than_days)$")
+    snapshot_id: int | None = None
     older_than_days: int | None = None
-    dry_run: bool = True
+    confirm: bool = False
 
 
 def _to_profile(payload: ConnectionTestRequest) -> ConnectionProfile:
@@ -66,18 +64,20 @@ def _render_index_html(hostname: str, ports: list[str], now_iso: str) -> str:
     </header>
 
     <section class="grid">
-      <article class="card span-4"><h2>Connection status</h2><div class="stat"><span>Detected serial ports</span><strong>{len(ports)}</strong></div><div id="connection-status" class="status-box">Ready.</div></article>
-      <article class="card span-4"><h2>Local node backup</h2><div class="stat"><span>Discovered nodes</span><strong id="count-nodes">0</strong></div><div id="backup-status" class="status-box">No backup running.</div><div id="local-node-summary" class="muted"></div></article>
-      <article class="card span-4"><h2>Snapshots / verification</h2><div id="snap-state"></div></article>
-
-      <article class="card span-6">
-        <h2>Connection panel</h2>
+      <article class="card span-12">
+        <h2>Connection & status</h2>
+        <div class="stat"><span>Detected serial ports</span><strong>{len(ports)}</strong></div>
         <label>Connection type</label><select id="conn-type"><option value="serial">serial</option><option value="tcp">tcp</option></select>
         <div id="serial-group"><label>Serial port</label><select id="serial-port"><option value="">Select serial port</option>{port_options}</select></div>
         <div id="tcp-host-group" class="hidden"><label>TCP host</label><input id="tcp-host" placeholder="192.168.1.50"></div>
         <div id="tcp-port-group" class="hidden"><label>TCP port</label><input id="tcp-port" value="4403"></div>
         <div class="actions"><button id="test-connection">Test connection</button><button id="read-local">Read local node</button><button id="read-discovered">Read discovered nodes</button><button id="run-backup" class="primary">Run full local backup</button></div>
+        <div id="op-state" class="muted">Idle</div>
+        <div id="connection-status" class="status-box">Ready.</div>
+        <div id="backup-status" class="status-box">No backup running.</div>
       </article>
+      <article class="card span-6"><h2>Local node summary</h2><div id="local-node-summary" class="muted"></div></article>
+      <article class="card span-6"><h2>Snapshots / verification</h2><div class="actions"><button id="cleanup-unverified">Delete unverified</button><button id="cleanup-empty">Delete failed/empty</button></div><div id="snap-state"></div></article>
 
       <article class="card span-6">
         <h2>Discovered nodes</h2>
@@ -92,6 +92,15 @@ def _render_index_html(hostname: str, ports: list[str], now_iso: str) -> str:
 </body>
 </html>"""
 
+
+
+@app.get('/snapshots/{snapshot_id}')
+def snapshot_review_page(snapshot_id: int) -> HTMLResponse:
+    return HTMLResponse(_render_snapshot_review_html(snapshot_id))
+
+
+def _render_snapshot_review_html(snapshot_id: int) -> str:
+    return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Snapshot #{snapshot_id}</title><link rel='stylesheet' href='/static/styles.css'></head><body><main class='container'><header class='header'><div><h1>Snapshot review #{snapshot_id}</h1><div class='muted'>Human verification required</div></div><a href='/' class='badge'>Back</a></header><section class='card'><div id='review-root'>Loading...</div></section></main><script>window.SNAPSHOT_ID={snapshot_id}</script><script src='/static/app.js'></script></body></html>"""
 
 @app.get('/api/status')
 def api_status():
@@ -159,30 +168,33 @@ def api_reject_snapshot(snapshot_id: int, payload: VerifyPayload):
 
 def _cleanup_preview():
     backups = Path('data/backups'); backups.mkdir(parents=True, exist_ok=True)
-    old = list(backups.glob('snapshot_*.json'))
     snaps = list_snapshots()
-    failed = [s for s in snaps if s.get('status')=='failed']
-    empty_partial = [s for s in snaps if s.get('status')=='partial' and int(s.get('node_count') or 0)==0]
-    referenced = {Path(s['normalized_path']) for s in snaps if s.get('normalized_path')} | {Path(s['raw_path']) for s in snaps if s.get('raw_path')}
-    orphan_files = [p for p in backups.rglob('*.json') if p not in referenced and not p.name.endswith('meshnodemgr.db')]
-    orphan_db = [s for s in snaps if s.get('normalized_path') and not Path(s['normalized_path']).exists()]
-    size = sum(p.stat().st_size for p in old + orphan_files if p.exists())
-    return {"old_format_snapshots": [str(p) for p in old], "failed_snapshots": failed, "empty_partial_snapshots": empty_partial, "orphan_files": [str(p) for p in orphan_files], "orphan_db_records": orphan_db, "total_reclaimable_size": size, "counts": {"old_format": len(old), "failed": len(failed), "empty_partial": len(empty_partial), "orphan_files": len(orphan_files), "orphan_db": len(orphan_db)}}
+    unverified = [s for s in snaps if int(s.get('verified') or 0) == 0]
+    failed_or_empty = [s for s in snaps if s.get('status') == 'failed' or (int(s.get('node_count') or 0) == 0 and int(s.get('verified') or 0) == 0)]
+    return {"counts": {"all": len(snaps), "unverified": len(unverified), "failed_or_empty": len(failed_or_empty)}}
 
-@app.get('/api/maintenance/cleanup-preview')
-def cleanup_preview():
-    return {"ok": True, "preview": _cleanup_preview()}
-
-@app.post('/api/maintenance/cleanup')
+@app.post('/api/snapshots/cleanup')
 def cleanup(payload: CleanupPayload):
-    preview = _cleanup_preview()
-    deleted = []
-    if payload.dry_run:
-        return {"ok": True, "dry_run": True, "preview": preview, "deleted": []}
-    if payload.delete_old_format:
-        for fp in preview['old_format_snapshots']:
-            p=Path(fp); p.unlink(missing_ok=True); deleted.append(fp)
-    if payload.delete_orphans:
-        for fp in preview['orphan_files']:
-            p=Path(fp); p.unlink(missing_ok=True); deleted.append(fp)
-    return {"ok": True, "dry_run": False, "deleted": deleted, "preview": preview}
+    if payload.mode == 'preview':
+        return {"ok": True, "preview": _cleanup_preview()}
+    if not payload.confirm:
+        raise HTTPException(status_code=400, detail='confirmation_required')
+    deleted_ids: list[int] = []
+    if payload.mode == 'single' and payload.snapshot_id:
+        if delete_snapshot(payload.snapshot_id):
+            deleted_ids = [payload.snapshot_id]
+    elif payload.mode == 'unverified':
+        deleted_ids = delete_snapshots_unverified()
+    elif payload.mode == 'failed_or_empty':
+        deleted_ids = delete_snapshots_failed_or_empty()
+    elif payload.mode == 'older_than_days' and payload.older_than_days is not None:
+        cutoff = datetime.utcnow().timestamp() - (payload.older_than_days * 86400)
+        for s in list_snapshots():
+            created = datetime.fromisoformat((s.get('created_at') or '').replace(' ', 'T')).timestamp() if s.get('created_at') else 0
+            if created and created < cutoff and delete_snapshot(int(s['id'])):
+                deleted_ids.append(int(s['id']))
+    for snap in deleted_ids:
+        for fp in [Path('data/backups') / str(snap)]:
+            if fp.exists() and fp.is_dir():
+                import shutil; shutil.rmtree(fp, ignore_errors=True)
+    return {"ok": True, "deleted_ids": deleted_ids, "preview": _cleanup_preview()}
