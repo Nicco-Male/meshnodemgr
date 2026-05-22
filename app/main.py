@@ -4,15 +4,32 @@ import socket
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
-from app.db import fetch_inventory, init_db
+from app.db import (
+    create_snapshot_record,
+    get_snapshot,
+    init_db,
+    insert_snapshot_nodes,
+    list_connections,
+    list_nodes,
+    list_snapshots,
+    verify_snapshot,
+)
 from app.services.discovery_service import discover_playbooks, discover_profiles
-from app.services.meshtastic_cli import run_meshtastic_info
+from app.services.meshtastic_service import ConnectionProfile, run_local_backup, test_connection
 from app.services.serial_service import list_serial_ports
 
 app = FastAPI(title="PiAns Mesh Node Manager")
+
+
+class ConnectionTestRequest(BaseModel):
+    type: str = Field(pattern="^(serial|tcp)$")
+    serial_port: str | None = None
+    host: str | None = None
+    port: int | None = None
 
 
 @app.on_event("startup")
@@ -27,195 +44,94 @@ def index() -> HTMLResponse:
     base_dir = Path(__file__).resolve().parents[1]
     profiles = discover_profiles(base_dir=base_dir)
     playbooks = discover_playbooks(base_dir=base_dir)
-
-    ports_html = "".join(f"<li><code>{p}</code></li>" for p in ports)
-    if not ports_html:
-        ports_html = "<li>Nessuna porta seriale trovata</li>"
-
-    profile_items = "".join(
-        f"<li><strong>{item.name or item.filename}</strong> <code>{item.filename}</code>{_render_errors(item.errors, item.valid)}</li>"
-        for item in profiles
-    )
-    if not profile_items:
-        profile_items = "<li>Nessun profilo YAML trovato</li>"
-
-    playbook_items = "".join(
-        f"<li><strong>{item.name or item.filename}</strong> <code>{item.filename}</code>{_render_errors(item.errors, item.valid)}</li>"
-        for item in playbooks
-    )
-    if not playbook_items:
-        playbook_items = "<li>Nessun playbook YAML trovato</li>"
-
-    return HTMLResponse(
-        f"""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>PiAns Mesh Node Manager</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body {{
-      font-family: system-ui, sans-serif;
-      background: #101418;
-      color: #e8f0f2;
-      margin: 0;
-      padding: 16px;
-    }}
-    .container {{
-      max-width: 680px;
-      margin: 0 auto;
-    }}
-    .card {{
-      background: #182026;
-      border: 1px solid #2d3a42;
-      border-radius: 14px;
-      padding: 16px;
-      margin-bottom: 12px;
-      box-shadow: 0 8px 24px rgba(0,0,0,.25);
-    }}
-    h1 {{ margin: 0 0 8px; color: #67d391; font-size: 1.4rem; }}
-    h2 {{ margin: 0 0 8px; font-size: 1.1rem; }}
-    code {{ background: #0b0f12; padding: 2px 6px; border-radius: 6px; }}
-    ul {{ padding-left: 18px; margin: 8px 0; }}
-    .warn {{ color: #ffc857; }}
-  </style>
-</head>
-<body>
-  <main class="container">
-    <section class="card">
-      <h1>PiAns Mesh Node Manager</h1>
-      <p>Hostname: <code>{hostname}</code></p>
-      <p>Ora: <code>{datetime.now().isoformat(timespec="seconds")}</code></p>
-    </section>
-
-    <section class="card">
-      <h2>USB / seriale</h2>
-      <ul>{ports_html}</ul>
-      <label for="port-select">Porta seriale</label>
-      <select id="port-select" style="display:block;width:100%;max-width:340px;margin:8px 0;padding:8px;border-radius:8px;background:#0b0f12;color:#e8f0f2;border:1px solid #2d3a42;">
-        <option value="">Seleziona una porta</option>
-        {"".join(f'<option value="{p}">{p}</option>' for p in ports)}
-      </select>
-      <button id="read-info" style="padding:8px 12px;border-radius:8px;border:1px solid #2d3a42;background:#22303a;color:#e8f0f2;">Leggi info nodo locale</button>
-      <pre id="node-info" style="white-space:pre-wrap;background:#0b0f12;border:1px solid #2d3a42;border-radius:8px;padding:10px;margin-top:10px;min-height:64px;">Nessuna richiesta inviata.</pre>
-      <p class="warn">Nessun nodo collegato è uno stato valido: l'app rimane operativa.</p>
-    </section>
-
-    <section class="card">
-      <h2>Profili e playbook</h2>
-      <h3 style="margin:8px 0 4px;font-size:1rem;">Profili</h3>
-      <ul>{profile_items}</ul>
-      <h3 style="margin:12px 0 4px;font-size:1rem;">Playbook</h3>
-      <ul>{playbook_items}</ul>
-    </section>
-
-    <section class="card">
-      <h2>API</h2>
-      <ul>
-        <li><code>/api/status</code></li>
-        <li><code>/api/serial/ports</code></li>
-        <li><code>/api/inventory</code></li>
-        <li><code>/api/profiles</code></li>
-        <li><code>/api/playbooks</code></li>
-        <li><code>/api/meshtastic/info?port=/dev/ttyACM0</code></li>
-      </ul>
-    </section>
-  </main>
-  <script>
-    const btn = document.getElementById("read-info");
-    const output = document.getElementById("node-info");
-    const select = document.getElementById("port-select");
-
-    btn?.addEventListener("click", async () => {{
-      const port = select?.value || "";
-      if (!port) {{
-        output.textContent = "Seleziona prima una porta seriale.";
-        return;
-      }}
-
-      output.textContent = "Lettura info in corso...";
-      try {{
-        const response = await fetch(`/api/meshtastic/info?port=${{encodeURIComponent(port)}}`);
-        const data = await response.json();
-        output.textContent = JSON.stringify(data, null, 2);
-      }} catch (err) {{
-        output.textContent = `Errore richiesta: ${{String(err)}}`;
-      }}
-    }});
-  </script>
-</body>
-</html>
-"""
-    )
+    return HTMLResponse(_render_index_html(hostname=hostname, ports=ports, now_iso=datetime.now().isoformat(timespec="seconds")))
 
 
-@app.get("/api/status")
-def status() -> dict[str, str | bool | int]:
-    ports = list_serial_ports()
-    return {
-        "hostname": socket.gethostname(),
-        "time": datetime.now().isoformat(timespec="seconds"),
-        "port": 8080,
-        "serial_device_count": len(ports),
-        "meshtastic_connected": len(ports) > 0,
-    }
+
+def _render_index_html(hostname: str, ports: list[str], now_iso: str) -> str:
+    port_options = "".join(f"<option value='{p}'>{p}</option>" for p in ports)
+    template = """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>PiAns Mesh Node Manager</title><style>
+body{{font-family:system-ui,sans-serif;background:#101418;color:#e8f0f2;margin:0;padding:16px}} .container{{max-width:760px;margin:0 auto}}
+.card{{background:#182026;border:1px solid #2d3a42;border-radius:14px;padding:14px;margin-bottom:12px}}
+input,select,button{{width:100%;max-width:420px;margin:6px 0;padding:9px;border-radius:8px;border:1px solid #2d3a42;background:#0b0f12;color:#e8f0f2}}
+button{{background:#22303a}} pre{{white-space:pre-wrap;background:#0b0f12;padding:10px;border-radius:8px;border:1px solid #2d3a42}}
+.list{{max-height:260px;overflow:auto}}
+</style></head><body><main class='container'>
+<section class='card'><h1>PiAns Mesh Node Manager</h1><p>__HOST__ · __NOW__</p></section>
+<section class='card'><h2>Backup & Inventory</h2>
+<label>Tipo connessione</label><select id='conn-type'><option value='serial'>Seriale</option><option value='tcp'>TCP/Wi-Fi</option></select>
+<label>Porta seriale</label><select id='serial-port'><option value=''>Seleziona</option>__PORT_OPTIONS__</select>
+<label>Host/IP TCP</label><input id='tcp-host' placeholder='192.168.1.50'>
+<label>Porta TCP</label><input id='tcp-port' placeholder='4403' value='4403'>
+<button id='test-connection'>Test connessione</button><button id='run-backup'>Run local backup</button>
+<pre id='workflow-output'>Pronto.</pre></section>
+<section class='card'><h2>Nodi scoperti</h2><input id='node-search' placeholder='Cerca per id/nome/modello'>
+<div class='list'><ul id='node-list'></ul></div></section>
+</main><script>
+function body(){const t=document.getElementById('conn-type').value;return {type:t,serial_port:document.getElementById('serial-port').value||null,host:document.getElementById('tcp-host').value||null,port:Number(document.getElementById('tcp-port').value)||null};}
+async function loadNodes(){const res=await fetch('/api/nodes');const d=await res.json();window.__nodes=d.items||[];renderNodes();}
+function renderNodes(){const q=(document.getElementById('node-search').value||'').toLowerCase();const ul=document.getElementById('node-list');ul.innerHTML='';(window.__nodes||[]).filter(n=>JSON.stringify(n).toLowerCase().includes(q)).forEach(n=>{const li=document.createElement('li');li.textContent=`${n.long_name||n.short_name||'unknown'} (${n.node_id||'n/a'})`;ul.appendChild(li);});if(!ul.innerHTML){ul.innerHTML='<li>Nessun nodo</li>'}}
+document.getElementById('node-search').addEventListener('input',renderNodes);
+document.getElementById('test-connection').addEventListener('click',async()=>{const o=document.getElementById('workflow-output');o.textContent='Testing...';const r=await fetch('/api/connections/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body())});o.textContent=JSON.stringify(await r.json(),null,2);});
+document.getElementById('run-backup').addEventListener('click',async()=>{const o=document.getElementById('workflow-output');o.textContent='Backup...';const r=await fetch('/api/backups/local',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body())});o.textContent=JSON.stringify(await r.json(),null,2);loadNodes();});
+loadNodes();</script></body></html>"""
+    return template.replace("__HOST__", hostname).replace("__NOW__", now_iso).replace("__PORT_OPTIONS__", port_options)
 
 
-@app.get("/api/serial/ports")
-def serial_ports() -> dict[str, list[str] | int]:
-    ports = list_serial_ports()
-    return {"count": len(ports), "ports": ports}
+@app.get("/api/connections")
+def connections() -> dict[str, object]:
+    items = list_connections()
+    return {"count": len(items), "items": items}
 
 
-@app.get("/api/meshtastic/info")
-def meshtastic_info(port: str = Query(default="", description="Serial port path")) -> dict[str, object]:
-    result = run_meshtastic_info(port=port)
-    if not result.ok:
-        return {
-            "ok": False,
-            "port": result.port,
-            "error": result.error,
-            "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "command": result.command,
-            "timeout_seconds": result.timeout_seconds,
+@app.post("/api/connections/test")
+def api_test_connection(payload: ConnectionTestRequest) -> dict[str, object]:
+    return test_connection(ConnectionProfile(**payload.model_dump()))
+
+
+@app.post("/api/backups/local")
+def api_backup_local(payload: ConnectionTestRequest) -> dict[str, object]:
+    result = run_local_backup(ConnectionProfile(**payload.model_dump()))
+    normalized = result["normalized"]
+    snapshot_id = create_snapshot_record(
+        {
+            "connection_type": normalized["connection_type"],
+            "connection_target": normalized["connection_target"],
+            "status": normalized["status"],
+            "raw_path": result["raw_path"],
+            "normalized_path": result["normalized_path"],
+            "local_node_id": normalized["local_node"]["node_id"],
+            "local_node_name": normalized["local_node"]["long_name"],
+            "node_count": normalized["node_count"],
         }
-
-    return {
-        "ok": True,
-        "port": result.port,
-        "returncode": result.returncode,
-        "command": result.command,
-        "timeout_seconds": result.timeout_seconds,
-        "info": result.info,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-    }
+    )
+    insert_snapshot_nodes(snapshot_id=snapshot_id, nodes=normalized["nodes"])
+    return {"ok": True, "snapshot_id": snapshot_id, "snapshot": get_snapshot(snapshot_id), "backup": result}
 
 
-@app.get("/api/inventory")
-def inventory() -> dict[str, list[dict[str, str | int | None]] | int]:
-    rows = fetch_inventory()
-    return {"count": len(rows), "items": rows}
+@app.get("/api/nodes")
+def api_nodes(snapshot_id: int | None = Query(default=None)) -> dict[str, object]:
+    items = list_nodes(snapshot_id=snapshot_id)
+    return {"count": len(items), "items": items}
 
 
-@app.get("/api/profiles")
-def profiles() -> dict[str, list[dict[str, object]] | int]:
-    base_dir = Path(__file__).resolve().parents[1]
-    items = discover_profiles(base_dir=base_dir)
-    return {"count": len(items), "items": [item.__dict__ for item in items]}
+@app.get("/api/snapshots")
+def api_snapshots() -> dict[str, object]:
+    items = list_snapshots()
+    return {"count": len(items), "items": items}
 
 
-@app.get("/api/playbooks")
-def playbooks() -> dict[str, list[dict[str, object]] | int]:
-    base_dir = Path(__file__).resolve().parents[1]
-    items = discover_playbooks(base_dir=base_dir)
-    return {"count": len(items), "items": [item.__dict__ for item in items]}
+@app.get("/api/snapshots/{snapshot_id}")
+def api_snapshot_detail(snapshot_id: int) -> dict[str, object]:
+    snapshot = get_snapshot(snapshot_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="snapshot_not_found")
+    return {"snapshot": snapshot, "nodes": list_nodes(snapshot_id=snapshot_id)}
 
 
-def _render_errors(errors: list[str] | None, valid: bool) -> str:
-    if valid or not errors:
-        return ""
-    return f' - <span class="warn">{"; ".join(errors)}</span>'
+@app.post("/api/snapshots/{snapshot_id}/verify")
+def api_verify_snapshot(snapshot_id: int) -> dict[str, object]:
+    if not verify_snapshot(snapshot_id):
+        raise HTTPException(status_code=404, detail="snapshot_not_found")
+    return {"ok": True, "snapshot": get_snapshot(snapshot_id)}

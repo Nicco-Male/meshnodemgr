@@ -2,24 +2,48 @@
 
 Portable Meshtastic node manager designed to run first on Raspberry Pi Zero W / Raspberry Pi OS Lite.
 
-Goal: provide an Ansible-like configuration manager for Meshtastic nodes.
+## New: Backup and Inventory Workflow (v1)
 
-## Current status
+This release adds the first real workflow for local backup and inventory collection, while keeping startup resilient with no connected device.
 
-- FastAPI web UI running on port 8080.
-- App starts even with no connected `/dev/ttyACM*` or `/dev/ttyUSB*` device.
-- Serial detection isolated in `app/services/serial_service.py`.
-- Lightweight SQLite initialization in `app/db.py` with `inventory` table creation.
-- Runtime database stored under `data/` (git-ignored).
-- YAML discovery for profiles/playbooks validates structure and reports issues.
+### What is included
+
+- Connection profile support:
+  - Serial via `/dev/ttyACM*` and `/dev/ttyUSB*`
+  - TCP/Wi-Fi via host/IP + port
+- Meshtastic service layer under `app/services/meshtastic_service.py`
+- Local backup flow:
+  - reads connection availability
+  - prepares local node/config/node-db extraction structure
+  - saves raw JSON + normalized JSON under `data/backups/`
+  - writes snapshot metadata and discovered node rows to SQLite
+- Human verification workflow:
+  - snapshots are unverified by default
+  - `POST /api/snapshots/{snapshot_id}/verify` marks a snapshot verified
+- Mobile-friendly UI section for:
+  - choosing connection type
+  - testing connection
+  - running local backup
+  - browsing and filtering discovered nodes
+
+> Note: this version intentionally does **not** perform remote write/apply and does **not** automatically modify any Meshtastic node.
 
 ## API endpoints
 
-- `GET /api/status`
-- `GET /api/serial/ports`
-- `GET /api/inventory`
-- `GET /api/profiles`
-- `GET /api/playbooks`
+- `GET /api/connections`
+- `POST /api/connections/test`
+- `POST /api/backups/local`
+- `GET /api/nodes`
+- `GET /api/snapshots`
+- `GET /api/snapshots/{snapshot_id}`
+- `POST /api/snapshots/{snapshot_id}/verify`
+
+## SQLite tables
+
+- `connections`
+- `nodes`
+- `snapshots`
+- `drift_checks`
 
 ## Run manually
 
@@ -27,14 +51,9 @@ Goal: provide an Ansible-like configuration manager for Meshtastic nodes.
     source .venv/bin/activate
     uvicorn app.main:app --host 0.0.0.0 --port 8080
 
-## Systemd service checks
-
-    sudo systemctl status meshnodemgr
-    sudo journalctl -u meshnodemgr -f
-
 ## Architecture notes
 
-- Keep hardware access in service modules (`app/services/`).
-- Keep startup resilient when no Meshtastic USB hardware is connected.
-- Keep runtime files in `data/` and `logs/` only.
-- Keep UI lightweight and phone-friendly.
+- Hardware access stays isolated in `app/services/`.
+- App startup does not require Meshtastic hardware.
+- Runtime artifacts remain under `data/` and `logs/`.
+- UI remains lightweight (no Docker/React/Node/Tailwind).
