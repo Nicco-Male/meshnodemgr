@@ -457,3 +457,31 @@ def reject_snapshot(snapshot_id: int, reason: str | None = None) -> bool:
         cur = conn.execute("UPDATE snapshots SET rejected = 1, rejected_at = CURRENT_TIMESTAMP, rejected_reason = ? WHERE id = ?", (reason, snapshot_id))
         conn.commit()
     return cur.rowcount > 0
+
+
+def delete_snapshot(snapshot_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM nodes WHERE snapshot_id = ?", (snapshot_id,))
+        cur = conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
+        conn.commit()
+    return cur.rowcount > 0
+
+
+def delete_snapshots_unverified() -> list[int]:
+    with sqlite3.connect(DB_PATH) as conn:
+        ids = [int(r[0]) for r in conn.execute("SELECT id FROM snapshots WHERE verified = 0").fetchall()]
+        if ids:
+            conn.executemany("DELETE FROM nodes WHERE snapshot_id = ?", [(i,) for i in ids])
+            conn.executemany("DELETE FROM snapshots WHERE id = ?", [(i,) for i in ids])
+            conn.commit()
+    return ids
+
+
+def delete_snapshots_failed_or_empty() -> list[int]:
+    with sqlite3.connect(DB_PATH) as conn:
+        ids = [int(r[0]) for r in conn.execute("SELECT id FROM snapshots WHERE status = 'failed' OR (node_count = 0 AND verified = 0)").fetchall()]
+        if ids:
+            conn.executemany("DELETE FROM nodes WHERE snapshot_id = ?", [(i,) for i in ids])
+            conn.executemany("DELETE FROM snapshots WHERE id = ?", [(i,) for i in ids])
+            conn.commit()
+    return ids
