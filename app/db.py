@@ -1,24 +1,81 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 DB_PATH = Path("data") / "meshnodemgr.db"
 
 
 def init_db() -> Path:
-    """Create runtime data dir and initialize lightweight SQLite schema."""
+    """Create runtime data dir and initialize SQLite schema."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS inventory (
+            CREATE TABLE IF NOT EXISTS connections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                node_id TEXT,
-                profile TEXT,
+                type TEXT NOT NULL CHECK(type IN ('serial', 'tcp')),
+                serial_port TEXT,
+                host TEXT,
+                port INTEGER,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                connection_type TEXT NOT NULL,
+                connection_target TEXT NOT NULL,
+                status TEXT NOT NULL,
+                raw_path TEXT NOT NULL,
+                normalized_path TEXT NOT NULL,
+                local_node_id TEXT,
+                local_node_name TEXT,
+                node_count INTEGER NOT NULL DEFAULT 0,
+                verified INTEGER NOT NULL DEFAULT 0,
+                verified_at TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id INTEGER NOT NULL,
+                node_num INTEGER,
+                node_id TEXT,
+                short_name TEXT,
+                long_name TEXT,
+                hw_model TEXT,
+                role TEXT,
+                last_heard INTEGER,
+                snr REAL,
+                raw_json TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(snapshot_id) REFERENCES snapshots(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS drift_checks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id INTEGER NOT NULL,
+                baseline_snapshot_id INTEGER,
+                drift_detected INTEGER NOT NULL DEFAULT 0,
+                summary TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(snapshot_id) REFERENCES snapshots(id),
+                FOREIGN KEY(baseline_snapshot_id) REFERENCES snapshots(id)
             )
             """
         )
@@ -27,12 +84,130 @@ def init_db() -> Path:
     return DB_PATH
 
 
-def fetch_inventory() -> list[dict[str, str | int | None]]:
-    """Return inventory rows as a list of dictionaries."""
+def list_connections() -> list[dict[str, Any]]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT id, name, node_id, profile, created_at FROM inventory ORDER BY id"
+            """
+            SELECT id, name, type, serial_port, host, port, enabled, created_at, updated_at
+            FROM connections ORDER BY updated_at DESC, id DESC
+            """
         ).fetchall()
-
     return [dict(row) for row in rows]
+
+
+def create_snapshot_record(payload: dict[str, Any]) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO snapshots (
+                connection_type, connection_target, status, raw_path, normalized_path,
+                local_node_id, local_node_name, node_count, verified
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                payload["connection_type"],
+                payload["connection_target"],
+                payload["status"],
+                payload["raw_path"],
+                payload["normalized_path"],
+                payload.get("local_node_id"),
+                payload.get("local_node_name"),
+                payload.get("node_count", 0),
+            ),
+        )
+        snapshot_id = int(cur.lastrowid)
+        conn.commit()
+    return snapshot_id
+
+
+def insert_snapshot_nodes(snapshot_id: int, nodes: list[dict[str, Any]]) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        for node in nodes:
+            conn.execute(
+                """
+                INSERT INTO nodes (
+                    snapshot_id, node_num, node_id, short_name, long_name,
+                    hw_model, role, last_heard, snr, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    node.get("node_num"),
+                    node.get("node_id"),
+                    node.get("short_name"),
+                    node.get("long_name"),
+                    node.get("hw_model"),
+                    node.get("role"),
+                    node.get("last_heard"),
+                    node.get("snr"),
+                    json.dumps(node.get("raw", {}), ensure_ascii=False),
+                ),
+            )
+        conn.commit()
+
+
+def list_nodes(snapshot_id: int | None = None) -> list[dict[str, Any]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        if snapshot_id is None:
+            rows = conn.execute(
+                """
+                SELECT n.*, s.created_at AS snapshot_created_at
+                FROM nodes n
+                JOIN snapshots s ON s.id = n.snapshot_id
+                ORDER BY n.id DESC
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT n.*, s.created_at AS snapshot_created_at
+                FROM nodes n
+                JOIN snapshots s ON s.id = n.snapshot_id
+                WHERE n.snapshot_id = ?
+                ORDER BY n.id
+                """,
+                (snapshot_id,),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_snapshots() -> list[dict[str, Any]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, connection_type, connection_target, status, raw_path,
+                   normalized_path, local_node_id, local_node_name, node_count,
+                   verified, verified_at, created_at
+            FROM snapshots
+            ORDER BY id DESC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_snapshot(snapshot_id: int) -> dict[str, Any] | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT id, connection_type, connection_target, status, raw_path,
+                   normalized_path, local_node_id, local_node_name, node_count,
+                   verified, verified_at, created_at
+            FROM snapshots WHERE id = ?
+            """,
+            (snapshot_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def verify_snapshot(snapshot_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "UPDATE snapshots SET verified = 1, verified_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (snapshot_id,),
+        )
+        conn.commit()
+    return cur.rowcount > 0
