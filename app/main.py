@@ -27,7 +27,7 @@ from app.db import (
     verify_remote_read,
 )
 from app.services.discovery_service import discover_playbooks, discover_profiles
-from app.services.meshtastic_service import ConnectionProfile, run_local_backup, run_remote_read_only, test_connection
+from app.services.meshtastic_service import ConnectionProfile, read_discovered_nodes, read_local_node, run_local_backup, run_remote_read_only, test_connection
 from app.services.serial_service import list_serial_ports
 
 app = FastAPI(title="PiAns Mesh Node Manager")
@@ -36,9 +36,13 @@ app.mount("/static", StaticFiles(directory=Path(__file__).resolve().parent / "st
 
 class ConnectionTestRequest(BaseModel):
     type: str = Field(pattern="^(serial|tcp)$")
-    serial_port: str | None = None
+    port: str | None = None
     host: str | None = None
-    port: int | None = None
+    tcp_port: int | None = None
+
+
+def _to_profile(payload: ConnectionTestRequest) -> ConnectionProfile:
+    return ConnectionProfile(type=payload.type, serial_port=payload.port if payload.type == "serial" else None, host=payload.host if payload.type == "tcp" else None, port=payload.tcp_port if payload.type == "tcp" else None)
 
 
 @app.on_event("startup")
@@ -76,16 +80,16 @@ def _render_index_html(hostname: str, ports: list[str], now_iso: str) -> str:
 
     <section class="grid">
       <article class="card span-4"><h2>Connection status</h2><div class="stat"><span>Detected serial ports</span><strong>{len(ports)}</strong></div><div id="connection-status" class="status-box">Ready.</div></article>
-      <article class="card span-4"><h2>Local node backup</h2><div class="stat"><span>Discovered nodes</span><strong id="count-nodes">0</strong></div><div id="backup-status" class="status-box">No backup running.</div></article>
+      <article class="card span-4"><h2>Local node backup</h2><div class="stat"><span>Discovered nodes</span><strong id="count-nodes">0</strong></div><div id="backup-status" class="status-box">No backup running.</div><div id="local-node-summary" class="muted"></div></article>
       <article class="card span-4"><h2>Snapshots / verification</h2><div id="snap-state"></div></article>
 
       <article class="card span-6">
         <h2>Connection panel</h2>
         <label>Connection type</label><select id="conn-type"><option value="serial">serial</option><option value="tcp">tcp</option></select>
-        <label>Serial port</label><select id="serial-port"><option value="">Select serial port</option>{port_options}</select>
-        <label>TCP host</label><input id="tcp-host" placeholder="192.168.1.50">
-        <label>TCP port</label><input id="tcp-port" value="4403">
-        <div class="actions"><button id="test-connection">Test connection</button><button id="run-backup" class="primary">Run local backup</button></div>
+        <div id="serial-group"><label>Serial port</label><select id="serial-port"><option value="">Select serial port</option>{port_options}</select></div>
+        <div id="tcp-host-group" class="hidden"><label>TCP host</label><input id="tcp-host" placeholder="192.168.1.50"></div>
+        <div id="tcp-port-group" class="hidden"><label>TCP port</label><input id="tcp-port" value="4403"></div>
+        <div class="actions"><button id="test-connection">Test connection</button><button id="read-local">Read local node</button><button id="read-discovered">Read discovered nodes</button><button id="run-backup" class="primary">Run full local backup</button></div>
       </article>
 
       <article class="card span-6">
@@ -110,12 +114,27 @@ def connections() -> dict[str, object]:
 
 @app.post("/api/connections/test")
 def api_test_connection(payload: ConnectionTestRequest) -> dict[str, object]:
-    return test_connection(ConnectionProfile(**payload.model_dump()))
+    return test_connection(_to_profile(payload))
+
+
+
+@app.post("/api/nodes/read-local")
+def api_read_local(payload: ConnectionTestRequest) -> dict[str, object]:
+    return {"ok": True, "result": read_local_node(_to_profile(payload))}
+
+
+@app.post("/api/nodes/read-discovered")
+def api_read_discovered(payload: ConnectionTestRequest) -> dict[str, object]:
+    profile = _to_profile(payload)
+    result = read_discovered_nodes(profile)
+    snapshot_id = create_snapshot_record({"connection_type": profile.type, "connection_target": profile.serial_port if profile.type == "serial" else f"{profile.host}:{profile.port}", "status": "nodes_read", "raw_path": "", "normalized_path": "", "local_node_id": None, "local_node_name": None, "node_count": len(result["nodes"])})
+    insert_snapshot_nodes(snapshot_id=snapshot_id, nodes=result["nodes"])
+    return {"ok": True, "snapshot_id": snapshot_id, "count": len(result["nodes"])}
 
 
 @app.post("/api/backups/local")
 def api_backup_local(payload: ConnectionTestRequest) -> dict[str, object]:
-    result = run_local_backup(ConnectionProfile(**payload.model_dump()))
+    result = run_local_backup(_to_profile(payload))
     normalized = result["normalized"]
     snapshot_id = create_snapshot_record(
         {
