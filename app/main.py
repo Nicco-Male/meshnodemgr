@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import socket
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 from app.db import fetch_inventory, init_db
+from app.services.discovery_service import discover_playbooks, discover_profiles
 from app.services.meshtastic_cli import run_meshtastic_info
 from app.services.serial_service import list_serial_ports
 
@@ -22,10 +24,27 @@ def on_startup() -> None:
 def index() -> HTMLResponse:
     hostname = socket.gethostname()
     ports = list_serial_ports()
+    base_dir = Path(__file__).resolve().parents[1]
+    profiles = discover_profiles(base_dir=base_dir)
+    playbooks = discover_playbooks(base_dir=base_dir)
 
     ports_html = "".join(f"<li><code>{p}</code></li>" for p in ports)
     if not ports_html:
         ports_html = "<li>Nessuna porta seriale trovata</li>"
+
+    profile_items = "".join(
+        f"<li><strong>{item.name or item.filename}</strong> <code>{item.filename}</code>{_render_errors(item.errors, item.valid)}</li>"
+        for item in profiles
+    )
+    if not profile_items:
+        profile_items = "<li>Nessun profilo YAML trovato</li>"
+
+    playbook_items = "".join(
+        f"<li><strong>{item.name or item.filename}</strong> <code>{item.filename}</code>{_render_errors(item.errors, item.valid)}</li>"
+        for item in playbooks
+    )
+    if not playbook_items:
+        playbook_items = "<li>Nessun playbook YAML trovato</li>"
 
     return HTMLResponse(
         f"""
@@ -84,11 +103,21 @@ def index() -> HTMLResponse:
     </section>
 
     <section class="card">
+      <h2>Profili e playbook</h2>
+      <h3 style="margin:8px 0 4px;font-size:1rem;">Profili</h3>
+      <ul>{profile_items}</ul>
+      <h3 style="margin:12px 0 4px;font-size:1rem;">Playbook</h3>
+      <ul>{playbook_items}</ul>
+    </section>
+
+    <section class="card">
       <h2>API</h2>
       <ul>
         <li><code>/api/status</code></li>
         <li><code>/api/serial/ports</code></li>
         <li><code>/api/inventory</code></li>
+        <li><code>/api/profiles</code></li>
+        <li><code>/api/playbooks</code></li>
         <li><code>/api/meshtastic/info?port=/dev/ttyACM0</code></li>
       </ul>
     </section>
@@ -139,8 +168,6 @@ def serial_ports() -> dict[str, list[str] | int]:
     return {"count": len(ports), "ports": ports}
 
 
-
-
 @app.get("/api/meshtastic/info")
 def meshtastic_info(port: str = Query(default="", description="Serial port path")) -> dict[str, object]:
     result = run_meshtastic_info(port=port)
@@ -167,7 +194,28 @@ def meshtastic_info(port: str = Query(default="", description="Serial port path"
         "stderr": result.stderr,
     }
 
+
 @app.get("/api/inventory")
 def inventory() -> dict[str, list[dict[str, str | int | None]] | int]:
     rows = fetch_inventory()
     return {"count": len(rows), "items": rows}
+
+
+@app.get("/api/profiles")
+def profiles() -> dict[str, list[dict[str, object]] | int]:
+    base_dir = Path(__file__).resolve().parents[1]
+    items = discover_profiles(base_dir=base_dir)
+    return {"count": len(items), "items": [item.__dict__ for item in items]}
+
+
+@app.get("/api/playbooks")
+def playbooks() -> dict[str, list[dict[str, object]] | int]:
+    base_dir = Path(__file__).resolve().parents[1]
+    items = discover_playbooks(base_dir=base_dir)
+    return {"count": len(items), "items": [item.__dict__ for item in items]}
+
+
+def _render_errors(errors: list[str] | None, valid: bool) -> str:
+    if valid or not errors:
+        return ""
+    return f' - <span class="warn">{"; ".join(errors)}</span>'
