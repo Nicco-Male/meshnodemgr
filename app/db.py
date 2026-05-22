@@ -97,6 +97,25 @@ def init_db() -> Path:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS remote_reads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL,
+                gateway_connection_type TEXT NOT NULL,
+                gateway_connection_target TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                timeout_seconds INTEGER NOT NULL DEFAULT 8,
+                error TEXT,
+                raw_path TEXT NOT NULL,
+                normalized_path TEXT NOT NULL,
+                verified INTEGER NOT NULL DEFAULT 0,
+                verified_at TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS drift_checks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 snapshot_id INTEGER NOT NULL,
@@ -312,3 +331,90 @@ def verify_snapshot(snapshot_id: int) -> bool:
         )
         conn.commit()
     return cur.rowcount > 0
+
+
+def create_remote_read_record(payload: dict[str, Any]) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO remote_reads (
+                node_id, gateway_connection_type, gateway_connection_target,
+                status, attempts, timeout_seconds, error, raw_path, normalized_path, verified
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                payload["node_id"],
+                payload["gateway_connection_type"],
+                payload["gateway_connection_target"],
+                payload["status"],
+                payload.get("attempts", 1),
+                payload.get("timeout_seconds", 8),
+                payload.get("error"),
+                payload["raw_path"],
+                payload["normalized_path"],
+            ),
+        )
+        remote_read_id = int(cur.lastrowid)
+        conn.commit()
+    return remote_read_id
+
+
+def list_remote_reads(node_id: str | None = None) -> list[dict[str, Any]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        if node_id:
+            rows = conn.execute(
+                """
+                SELECT id, node_id, gateway_connection_type, gateway_connection_target, status,
+                       attempts, timeout_seconds, error, raw_path, normalized_path, verified,
+                       verified_at, created_at
+                FROM remote_reads
+                WHERE node_id = ?
+                ORDER BY id DESC
+                """,
+                (node_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, node_id, gateway_connection_type, gateway_connection_target, status,
+                       attempts, timeout_seconds, error, raw_path, normalized_path, verified,
+                       verified_at, created_at
+                FROM remote_reads
+                ORDER BY id DESC
+                """
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def verify_remote_read(remote_read_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            """
+            UPDATE remote_reads
+            SET verified = 1,
+                verified_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (remote_read_id,),
+        )
+        conn.commit()
+    return cur.rowcount > 0
+
+
+def update_managed_node_remote_state(node_id: str, ok: bool, error: str | None = None) -> None:
+    state = "remote_read_ok" if ok else "remote_read_failed"
+    reason = "Remote read completed. Pending human verification." if ok else "Remote read failed."
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            UPDATE managed_nodes
+            SET management_state = ?,
+                state_reason = ?,
+                remote_read_last_error = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE node_id = ?
+            """,
+            (state, reason, error, node_id),
+        )
+        conn.commit()
