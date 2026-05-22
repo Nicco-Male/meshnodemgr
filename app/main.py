@@ -14,8 +14,11 @@ from app.db import (
     init_db,
     insert_snapshot_nodes,
     list_connections,
+    list_managed_nodes,
     list_nodes,
     list_snapshots,
+    mark_node_as_managed,
+    unmanage_node,
     verify_snapshot,
 )
 from app.services.discovery_service import discover_playbooks, discover_profiles
@@ -42,8 +45,8 @@ def index() -> HTMLResponse:
     hostname = socket.gethostname()
     ports = list_serial_ports()
     base_dir = Path(__file__).resolve().parents[1]
-    profiles = discover_profiles(base_dir=base_dir)
-    playbooks = discover_playbooks(base_dir=base_dir)
+    discover_profiles(base_dir=base_dir)
+    discover_playbooks(base_dir=base_dir)
     return HTMLResponse(_render_index_html(hostname=hostname, ports=ports, now_iso=datetime.now().isoformat(timespec="seconds")))
 
 
@@ -56,7 +59,8 @@ body{{font-family:system-ui,sans-serif;background:#101418;color:#e8f0f2;margin:0
 .card{{background:#182026;border:1px solid #2d3a42;border-radius:14px;padding:14px;margin-bottom:12px}}
 input,select,button{{width:100%;max-width:420px;margin:6px 0;padding:9px;border-radius:8px;border:1px solid #2d3a42;background:#0b0f12;color:#e8f0f2}}
 button{{background:#22303a}} pre{{white-space:pre-wrap;background:#0b0f12;padding:10px;border-radius:8px;border:1px solid #2d3a42}}
-.list{{max-height:260px;overflow:auto}}
+.list{{max-height:260px;overflow:auto}} .node-row{{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #2d3a42}}
+.muted{{opacity:0.7;font-size:0.9em}}
 </style></head><body><main class='container'>
 <section class='card'><h1>PiAns Mesh Node Manager</h1><p>__HOST__ · __NOW__</p></section>
 <section class='card'><h2>Backup & Inventory</h2>
@@ -68,10 +72,14 @@ button{{background:#22303a}} pre{{white-space:pre-wrap;background:#0b0f12;paddin
 <pre id='workflow-output'>Pronto.</pre></section>
 <section class='card'><h2>Nodi scoperti</h2><input id='node-search' placeholder='Cerca per id/nome/modello'>
 <div class='list'><ul id='node-list'></ul></div></section>
+<section class='card'><h2>Nodi gestiti</h2><div class='list'><ul id='managed-node-list'></ul></div></section>
 </main><script>
 function body(){const t=document.getElementById('conn-type').value;return {type:t,serial_port:document.getElementById('serial-port').value||null,host:document.getElementById('tcp-host').value||null,port:Number(document.getElementById('tcp-port').value)||null};}
-async function loadNodes(){const res=await fetch('/api/nodes');const d=await res.json();window.__nodes=d.items||[];renderNodes();}
-function renderNodes(){const q=(document.getElementById('node-search').value||'').toLowerCase();const ul=document.getElementById('node-list');ul.innerHTML='';(window.__nodes||[]).filter(n=>JSON.stringify(n).toLowerCase().includes(q)).forEach(n=>{const li=document.createElement('li');li.textContent=`${n.long_name||n.short_name||'unknown'} (${n.node_id||'n/a'})`;ul.appendChild(li);});if(!ul.innerHTML){ul.innerHTML='<li>Nessun nodo</li>'}}
+async function loadNodes(){const res=await fetch('/api/nodes');const d=await res.json();window.__nodes=d.items||[];await loadManagedNodes();renderNodes();}
+async function loadManagedNodes(){const res=await fetch('/api/managed-nodes');const d=await res.json();window.__managed=(d.items||[]).reduce((acc,n)=>{acc[n.node_id]=n;return acc;},{});renderManagedNodes();}
+function renderNodes(){const q=(document.getElementById('node-search').value||'').toLowerCase();const ul=document.getElementById('node-list');ul.innerHTML='';(window.__nodes||[]).filter(n=>JSON.stringify(n).toLowerCase().includes(q)).forEach(n=>{const li=document.createElement('li');const managed=window.__managed?.[n.node_id];const state=managed?managed.management_state:'discovered';li.innerHTML=`<div class='node-row'><div><strong>${n.long_name||n.short_name||'unknown'}</strong><div class='muted'>${n.node_id||'n/a'} · stato: ${state}</div></div><button data-node='${n.node_id}'>${managed?'Unmanage':'Manage'}</button></div>`;ul.appendChild(li);});if(!ul.innerHTML){ul.innerHTML='<li>Nessun nodo</li>'}}
+function renderManagedNodes(){const ul=document.getElementById('managed-node-list');ul.innerHTML='';const items=Object.values(window.__managed||{});items.forEach(n=>{const li=document.createElement('li');li.textContent=`${n.long_name||n.short_name||'unknown'} (${n.node_id}) · ${n.management_state}`;ul.appendChild(li);});if(!ul.innerHTML){ul.innerHTML='<li>Nessun nodo gestito</li>';}}
+document.getElementById('node-list').addEventListener('click',async(e)=>{if(e.target.tagName!=='BUTTON'){return;}const nodeId=e.target.getAttribute('data-node');if(!nodeId){return;}const managed=window.__managed?.[nodeId];const endpoint=managed?`/api/nodes/${nodeId}/unmanage`:`/api/nodes/${nodeId}/manage`;await fetch(endpoint,{method:'POST'});await loadManagedNodes();renderNodes();});
 document.getElementById('node-search').addEventListener('input',renderNodes);
 document.getElementById('test-connection').addEventListener('click',async()=>{const o=document.getElementById('workflow-output');o.textContent='Testing...';const r=await fetch('/api/connections/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body())});o.textContent=JSON.stringify(await r.json(),null,2);});
 document.getElementById('run-backup').addEventListener('click',async()=>{const o=document.getElementById('workflow-output');o.textContent='Backup...';const r=await fetch('/api/backups/local',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body())});o.textContent=JSON.stringify(await r.json(),null,2);loadNodes();});
@@ -113,6 +121,26 @@ def api_backup_local(payload: ConnectionTestRequest) -> dict[str, object]:
 @app.get("/api/nodes")
 def api_nodes(snapshot_id: int | None = Query(default=None)) -> dict[str, object]:
     items = list_nodes(snapshot_id=snapshot_id)
+    return {"count": len(items), "items": items}
+
+
+@app.post("/api/nodes/{node_id}/manage")
+def api_manage_node(node_id: str) -> dict[str, object]:
+    if not mark_node_as_managed(node_id=node_id):
+        raise HTTPException(status_code=404, detail="node_not_found")
+    return {"ok": True, "node": node_id, "management_state": "pending_management"}
+
+
+@app.post("/api/nodes/{node_id}/unmanage")
+def api_unmanage_node(node_id: str) -> dict[str, object]:
+    if not unmanage_node(node_id=node_id):
+        raise HTTPException(status_code=404, detail="managed_node_not_found")
+    return {"ok": True, "node": node_id, "management_state": "discovered"}
+
+
+@app.get("/api/managed-nodes")
+def api_managed_nodes() -> dict[str, object]:
+    items = list_managed_nodes()
     return {"count": len(items), "items": items}
 
 

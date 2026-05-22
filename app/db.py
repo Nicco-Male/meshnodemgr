@@ -7,6 +7,17 @@ from typing import Any
 
 DB_PATH = Path("data") / "meshnodemgr.db"
 
+MANAGEMENT_STATES = (
+    "discovered",
+    "pending_management",
+    "remote_read_requested",
+    "remote_read_ok",
+    "remote_read_failed",
+    "human_verified",
+    "managed",
+    "drift_detected",
+)
+
 
 def init_db() -> Path:
     """Create runtime data dir and initialize SQLite schema."""
@@ -62,6 +73,25 @@ def init_db() -> Path:
                 raw_json TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(snapshot_id) REFERENCES snapshots(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS managed_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL UNIQUE,
+                node_num INTEGER,
+                short_name TEXT,
+                long_name TEXT,
+                hw_model TEXT,
+                role TEXT,
+                management_state TEXT NOT NULL DEFAULT 'pending_management',
+                state_reason TEXT,
+                planned_remote_read INTEGER NOT NULL DEFAULT 1,
+                remote_read_last_error TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
@@ -171,6 +201,77 @@ def list_nodes(snapshot_id: int | None = None) -> list[dict[str, Any]]:
                 (snapshot_id,),
             ).fetchall()
     return [dict(row) for row in rows]
+
+
+def mark_node_as_managed(node_id: str) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        node = conn.execute(
+            """
+            SELECT node_id, node_num, short_name, long_name, hw_model, role
+            FROM nodes
+            WHERE node_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (node_id,),
+        ).fetchone()
+        if not node:
+            return False
+
+        conn.execute(
+            """
+            INSERT INTO managed_nodes (
+                node_id, node_num, short_name, long_name, hw_model, role,
+                management_state, state_reason, planned_remote_read, remote_read_last_error,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending_management', ?, 1, NULL, CURRENT_TIMESTAMP)
+            ON CONFLICT(node_id) DO UPDATE SET
+                node_num=excluded.node_num,
+                short_name=excluded.short_name,
+                long_name=excluded.long_name,
+                hw_model=excluded.hw_model,
+                role=excluded.role,
+                management_state='pending_management',
+                state_reason=excluded.state_reason,
+                planned_remote_read=1,
+                remote_read_last_error=NULL,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (
+                node["node_id"],
+                node["node_num"],
+                node["short_name"],
+                node["long_name"],
+                node["hw_model"],
+                node["role"],
+                "Remote read planned only; no remote command sent yet.",
+            ),
+        )
+        conn.commit()
+    return True
+
+
+def unmanage_node(node_id: str) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("DELETE FROM managed_nodes WHERE node_id = ?", (node_id,))
+        conn.commit()
+    return cur.rowcount > 0
+
+
+def list_managed_nodes() -> list[dict[str, Any]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, node_id, node_num, short_name, long_name, hw_model, role,
+                   management_state, state_reason, planned_remote_read,
+                   remote_read_last_error, created_at, updated_at
+            FROM managed_nodes
+            ORDER BY updated_at DESC, id DESC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows if row["management_state"] in MANAGEMENT_STATES]
 
 
 def list_snapshots() -> list[dict[str, Any]]:
