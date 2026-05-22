@@ -28,6 +28,13 @@ This release adds the first real workflow for local backup and inventory collect
 
 > Note: this version intentionally does **not** perform remote write/apply and does **not** automatically modify any Meshtastic node.
 
+## UI dashboard (lightweight, mobile-first)
+
+- Modern dark dashboard theme with Meshtastic-inspired green accents.
+- Mobile-first responsive card/grid layout for phone and desktop.
+- Static assets served locally from `app/static/styles.css` and `app/static/app.js`.
+- No React/Node/Tailwind/Bootstrap/CDN; no frontend build step required.
+
 ## API endpoints
 
 - `GET /api/connections`

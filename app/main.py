@@ -6,6 +6,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.db import (
@@ -30,6 +31,7 @@ from app.services.meshtastic_service import ConnectionProfile, run_local_backup,
 from app.services.serial_service import list_serial_ports
 
 app = FastAPI(title="PiAns Mesh Node Manager")
+app.mount("/static", StaticFiles(directory=Path(__file__).resolve().parent / "static"), name="static")
 
 
 class ConnectionTestRequest(BaseModel):
@@ -57,48 +59,47 @@ def index() -> HTMLResponse:
 
 def _render_index_html(hostname: str, ports: list[str], now_iso: str) -> str:
     port_options = "".join(f"<option value='{p}'>{p}</option>" for p in ports)
-    template = """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>PiAns Mesh Node Manager</title><style>
-body{{font-family:system-ui,sans-serif;background:#101418;color:#e8f0f2;margin:0;padding:16px}} .container{{max-width:760px;margin:0 auto}}
-.card{{background:#182026;border:1px solid #2d3a42;border-radius:14px;padding:14px;margin-bottom:12px}}
-input,select,button{{width:100%;max-width:420px;margin:6px 0;padding:9px;border-radius:8px;border:1px solid #2d3a42;background:#0b0f12;color:#e8f0f2}}
-button{{background:#22303a}} pre{{white-space:pre-wrap;background:#0b0f12;padding:10px;border-radius:8px;border:1px solid #2d3a42}}
-.list{{max-height:260px;overflow:auto}} .node-row{{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #2d3a42}}
-.muted{{opacity:0.7;font-size:0.9em}}
-</style></head><body><main class='container'>
-<section class='card'><h1>PiAns Mesh Node Manager</h1><p>__HOST__ · __NOW__</p></section>
-<section class='card'><h2>Backup & Inventory</h2>
-<label>Tipo connessione</label><select id='conn-type'><option value='serial'>Seriale</option><option value='tcp'>TCP/Wi-Fi</option></select>
-<label>Porta seriale</label><select id='serial-port'><option value=''>Seleziona</option>__PORT_OPTIONS__</select>
-<label>Host/IP TCP</label><input id='tcp-host' placeholder='192.168.1.50'>
-<label>Porta TCP</label><input id='tcp-port' placeholder='4403' value='4403'>
-<button id='test-connection'>Test connessione</button><button id='run-backup'>Run local backup</button>
-<pre id='workflow-output'>Pronto.</pre></section>
-<section class='card'><h2>Nodi scoperti</h2><input id='node-search' placeholder='Cerca per id/nome/modello'>
-<div class='list'><ul id='node-list'></ul></div></section>
-<section class='card'><h2>Nodi gestiti</h2><div class='list'><ul id='managed-node-list'></ul></div></section>
-<section class='card'><h2>Remote Admin Read (solo lettura)</h2>
-<label>Node ID gestito</label><input id='remote-node-id' placeholder='!abcd1234'>
-<label>Timeout secondi</label><input id='remote-timeout' type='number' value='8'>
-<label>Retry</label><input id='remote-retries' type='number' value='2'>
-<button id='remote-read'>Request remote read</button>
-<button id='remote-verify'>Human verification</button>
-<pre id='remote-output'>Nessuna lettura remota.</pre>
-</section>
-</main><script>
-function body(){const t=document.getElementById('conn-type').value;return {type:t,serial_port:document.getElementById('serial-port').value||null,host:document.getElementById('tcp-host').value||null,port:Number(document.getElementById('tcp-port').value)||null};}
-async function loadNodes(){const res=await fetch('/api/nodes');const d=await res.json();window.__nodes=d.items||[];await loadManagedNodes();renderNodes();}
-async function loadManagedNodes(){const res=await fetch('/api/managed-nodes');const d=await res.json();window.__managed=(d.items||[]).reduce((acc,n)=>{acc[n.node_id]=n;return acc;},{});renderManagedNodes();}
-function renderNodes(){const q=(document.getElementById('node-search').value||'').toLowerCase();const ul=document.getElementById('node-list');ul.innerHTML='';(window.__nodes||[]).filter(n=>JSON.stringify(n).toLowerCase().includes(q)).forEach(n=>{const li=document.createElement('li');const managed=window.__managed?.[n.node_id];const state=managed?managed.management_state:'discovered';li.innerHTML=`<div class='node-row'><div><strong>${n.long_name||n.short_name||'unknown'}</strong><div class='muted'>${n.node_id||'n/a'} · stato: ${state}</div></div><button data-node='${n.node_id}'>${managed?'Unmanage':'Manage'}</button></div>`;ul.appendChild(li);});if(!ul.innerHTML){ul.innerHTML='<li>Nessun nodo</li>'}}
-function renderManagedNodes(){const ul=document.getElementById('managed-node-list');ul.innerHTML='';const items=Object.values(window.__managed||{});items.forEach(n=>{const li=document.createElement('li');li.textContent=`${n.long_name||n.short_name||'unknown'} (${n.node_id}) · ${n.management_state}`;ul.appendChild(li);});if(!ul.innerHTML){ul.innerHTML='<li>Nessun nodo gestito</li>';}}
-document.getElementById('node-list').addEventListener('click',async(e)=>{if(e.target.tagName!=='BUTTON'){return;}const nodeId=e.target.getAttribute('data-node');if(!nodeId){return;}const managed=window.__managed?.[nodeId];const endpoint=managed?`/api/nodes/${nodeId}/unmanage`:`/api/nodes/${nodeId}/manage`;await fetch(endpoint,{method:'POST'});await loadManagedNodes();renderNodes();});
-document.getElementById('node-search').addEventListener('input',renderNodes);
-document.getElementById('test-connection').addEventListener('click',async()=>{const o=document.getElementById('workflow-output');o.textContent='Testing...';const r=await fetch('/api/connections/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body())});o.textContent=JSON.stringify(await r.json(),null,2);});
-document.getElementById('run-backup').addEventListener('click',async()=>{const o=document.getElementById('workflow-output');o.textContent='Backup...';const r=await fetch('/api/backups/local',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body())});o.textContent=JSON.stringify(await r.json(),null,2);loadNodes();});
-document.getElementById('remote-read').addEventListener('click',async()=>{const o=document.getElementById('remote-output');const nodeId=(document.getElementById('remote-node-id').value||'').trim();if(!nodeId){o.textContent='Inserire node id';return;}o.textContent='Remote read in corso...';const r=await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/remote-read`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({connection:body(),timeout_seconds:Number(document.getElementById('remote-timeout').value)||8,retries:Number(document.getElementById('remote-retries').value)||2})});o.textContent=JSON.stringify(await r.json(),null,2);});
-document.getElementById('remote-verify').addEventListener('click',async()=>{const o=document.getElementById('remote-output');const parsed=JSON.parse(o.textContent||'{}');const id=parsed?.remote_read_id;if(!id){o.textContent='Nessun remote_read_id da verificare';return;}const r=await fetch(`/api/remote-reads/${id}/verify`,{method:'POST'});o.textContent=JSON.stringify(await r.json(),null,2);});
-loadNodes();</script></body></html>"""
-    return template.replace("__HOST__", hostname).replace("__NOW__", now_iso).replace("__PORT_OPTIONS__", port_options)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PiAns Mesh Node Manager</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="container">
+    <header class="header">
+      <div><h1>PiAns Mesh Node Manager</h1><div class="muted">Meshtastic dashboard</div></div>
+      <div class="muted">{hostname} · {now_iso}</div>
+    </header>
+
+    <section class="grid">
+      <article class="card span-4"><h2>Connection status</h2><div class="stat"><span>Detected serial ports</span><strong>{len(ports)}</strong></div><div id="connection-status" class="status-box">Ready.</div></article>
+      <article class="card span-4"><h2>Local node backup</h2><div class="stat"><span>Discovered nodes</span><strong id="count-nodes">0</strong></div><div id="backup-status" class="status-box">No backup running.</div></article>
+      <article class="card span-4"><h2>Snapshots / verification</h2><div id="snap-state"></div></article>
+
+      <article class="card span-6">
+        <h2>Connection panel</h2>
+        <label>Connection type</label><select id="conn-type"><option value="serial">serial</option><option value="tcp">tcp</option></select>
+        <label>Serial port</label><select id="serial-port"><option value="">Select serial port</option>{port_options}</select>
+        <label>TCP host</label><input id="tcp-host" placeholder="192.168.1.50">
+        <label>TCP port</label><input id="tcp-port" value="4403">
+        <div class="actions"><button id="test-connection">Test connection</button><button id="run-backup" class="primary">Run local backup</button></div>
+      </article>
+
+      <article class="card span-6">
+        <h2>Discovered nodes</h2>
+        <label>Search</label><input id="node-search" placeholder="Search by id, name, model">
+        <div class="list" id="node-list"></div>
+      </article>
+
+      <article class="card span-12"><h2>Management state</h2><p class="muted">Use Manage/Unmanage on discovered nodes to update state.</p></article>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>"""
 
 
 @app.get("/api/connections")
