@@ -3,10 +3,11 @@ from __future__ import annotations
 import socket
 from datetime import datetime
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 from app.db import fetch_inventory, init_db
+from app.services.meshtastic_cli import run_meshtastic_info
 from app.services.serial_service import list_serial_ports
 
 app = FastAPI(title="PiAns Mesh Node Manager")
@@ -72,6 +73,13 @@ def index() -> HTMLResponse:
     <section class="card">
       <h2>USB / seriale</h2>
       <ul>{ports_html}</ul>
+      <label for="port-select">Porta seriale</label>
+      <select id="port-select" style="display:block;width:100%;max-width:340px;margin:8px 0;padding:8px;border-radius:8px;background:#0b0f12;color:#e8f0f2;border:1px solid #2d3a42;">
+        <option value="">Seleziona una porta</option>
+        {"".join(f'<option value="{p}">{p}</option>' for p in ports)}
+      </select>
+      <button id="read-info" style="padding:8px 12px;border-radius:8px;border:1px solid #2d3a42;background:#22303a;color:#e8f0f2;">Leggi info nodo locale</button>
+      <pre id="node-info" style="white-space:pre-wrap;background:#0b0f12;border:1px solid #2d3a42;border-radius:8px;padding:10px;margin-top:10px;min-height:64px;">Nessuna richiesta inviata.</pre>
       <p class="warn">Nessun nodo collegato è uno stato valido: l'app rimane operativa.</p>
     </section>
 
@@ -81,9 +89,32 @@ def index() -> HTMLResponse:
         <li><code>/api/status</code></li>
         <li><code>/api/serial/ports</code></li>
         <li><code>/api/inventory</code></li>
+        <li><code>/api/meshtastic/info?port=/dev/ttyACM0</code></li>
       </ul>
     </section>
   </main>
+  <script>
+    const btn = document.getElementById("read-info");
+    const output = document.getElementById("node-info");
+    const select = document.getElementById("port-select");
+
+    btn?.addEventListener("click", async () => {{
+      const port = select?.value || "";
+      if (!port) {{
+        output.textContent = "Seleziona prima una porta seriale.";
+        return;
+      }}
+
+      output.textContent = "Lettura info in corso...";
+      try {{
+        const response = await fetch(`/api/meshtastic/info?port=${{encodeURIComponent(port)}}`);
+        const data = await response.json();
+        output.textContent = JSON.stringify(data, null, 2);
+      }} catch (err) {{
+        output.textContent = `Errore richiesta: ${{String(err)}}`;
+      }}
+    }});
+  </script>
 </body>
 </html>
 """
@@ -107,6 +138,34 @@ def serial_ports() -> dict[str, list[str] | int]:
     ports = list_serial_ports()
     return {"count": len(ports), "ports": ports}
 
+
+
+
+@app.get("/api/meshtastic/info")
+def meshtastic_info(port: str = Query(default="", description="Serial port path")) -> dict[str, object]:
+    result = run_meshtastic_info(port=port)
+    if not result.ok:
+        return {
+            "ok": False,
+            "port": result.port,
+            "error": result.error,
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "command": result.command,
+            "timeout_seconds": result.timeout_seconds,
+        }
+
+    return {
+        "ok": True,
+        "port": result.port,
+        "returncode": result.returncode,
+        "command": result.command,
+        "timeout_seconds": result.timeout_seconds,
+        "info": result.info,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
 
 @app.get("/api/inventory")
 def inventory() -> dict[str, list[dict[str, str | int | None]] | int]:
