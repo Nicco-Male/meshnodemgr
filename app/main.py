@@ -97,6 +97,11 @@ def _render_index_html(hostname: str, ports: list[str], now_iso: str) -> str:
 def api_status():
     return {"ok": True, "service": "meshnodemgr", "hostname": socket.gethostname()}
 
+
+@app.get('/api/connections')
+def api_connections():
+    ports = list_serial_ports()
+    return {"ok": True, "serial_ports": ports, "count": len(ports)}
 @app.post('/api/connections/test')
 def api_test_connection(payload: ConnectionTestRequest):
     return test_connection(_to_profile(payload))
