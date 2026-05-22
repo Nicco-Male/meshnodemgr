@@ -7,37 +7,31 @@ Goal: provide an Ansible-like configuration manager for Meshtastic nodes.
 ## Current status
 
 - FastAPI web UI running on port 8080.
-- USB/serial port detection.
-- Local Meshtastic CLI dependency.
-- Basic project skeleton.
+- App starts even with no connected `/dev/ttyACM*` or `/dev/ttyUSB*` device.
+- Serial detection isolated in `app/services/serial_service.py`.
+- Lightweight SQLite initialization in `app/db.py` with `inventory` table creation.
+- Runtime database stored under `data/` (git-ignored).
 
-## Target architecture
+## API endpoints
 
-- Raspberry Pi connected via USB to a local Meshtastic node.
-- Phone connected to the Raspberry via Wi-Fi/hotspot.
-- Web UI for inventory, backups, profiles and playbooks.
-- Future support for Meshtastic remote administration.
+- `GET /api/status`
+- `GET /api/serial/ports`
+- `GET /api/inventory`
 
 ## Run manually
 
-    cd ~/meshnodemgr
+    cd /home/nicco/meshnodemgr
     source .venv/bin/activate
     uvicorn app.main:app --host 0.0.0.0 --port 8080
 
-## Systemd service
+## Systemd service checks
 
     sudo systemctl status meshnodemgr
     sudo journalctl -u meshnodemgr -f
 
-## Project priorities
+## Architecture notes
 
-1. Detect local USB Meshtastic node.
-2. Read local node info.
-3. Build node inventory.
-4. Backup node configuration.
-5. Store desired profiles in YAML.
-6. Show config diff.
-7. Apply profiles locally.
-8. Add remote admin support.
-9. Add hotspot setup.
-10. Build nicer mobile UI.
+- Keep hardware access in service modules (`app/services/`).
+- Keep startup resilient when no Meshtastic USB hardware is connected.
+- Keep runtime files in `data/` and `logs/` only.
+- Keep UI lightweight and phone-friendly.
