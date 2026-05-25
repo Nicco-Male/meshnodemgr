@@ -43,10 +43,18 @@ def on_startup() -> None:
 @app.get("/")
 def index() -> HTMLResponse:
     hostname = socket.gethostname(); ports = list_serial_ports()
-    return HTMLResponse(_render_index_html(hostname=hostname, ports=ports, now_iso=datetime.now().isoformat(timespec="seconds")))
+    return HTMLResponse(_render_index_html(hostname=hostname, ports=ports, now_iso=datetime.now().isoformat(timespec="seconds"), static_version=_static_version()))
 
 
-def _render_index_html(hostname: str, ports: list[str], now_iso: str) -> str:
+def _static_version() -> str:
+    static_root = Path(__file__).resolve().parent / "static"
+    app_js = static_root / "app.js"
+    styles = static_root / "styles.css"
+    stamp = int(max(app_js.stat().st_mtime, styles.stat().st_mtime))
+    return str(stamp)
+
+
+def _render_index_html(hostname: str, ports: list[str], now_iso: str, static_version: str) -> str:
     port_options = "".join(f"<option value='{p}'>{p}</option>" for p in ports)
     return f"""<!doctype html>
 <html lang="en">
@@ -54,7 +62,7 @@ def _render_index_html(hostname: str, ports: list[str], now_iso: str) -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PiAns Mesh Node Manager</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v={static_version}">
 </head>
 <body>
   <main class="container">
@@ -77,7 +85,7 @@ def _render_index_html(hostname: str, ports: list[str], now_iso: str) -> str:
         <div id="backup-status" class="status-box">No backup running.</div>
       </article>
       <article class="card span-6"><h2>Local node summary</h2><div id="local-node-summary" class="muted"></div></article>
-      <article class="card span-6"><h2>Snapshots / verification</h2><div class="actions"><button id="cleanup-unverified">Delete unverified</button><button id="cleanup-empty">Delete failed/empty</button></div><div class='cleanup-age'><label>Cleanup older than days</label><input id='cleanup-days' type='number' min='1' value='30'><button id='cleanup-older'>Cleanup by age</button><div id='cleanup-preview' class='muted'></div></div><div id="snap-state"></div></article>
+      <article class="card span-6"><h2>Snapshots / verification</h2><div class="actions"><button id="cleanup-unverified">Delete unverified</button><button id="cleanup-empty">Delete failed/empty</button></div><div class='cleanup-age'><label>Cleanup older than days</label><input id='cleanup-days' type='number' min='1' value='30'><button id='cleanup-older'>Cleanup by age</button><div id='cleanup-preview' class='muted'></div><div id='cleanup-result' class='status-box status-warning'>No cleanup executed yet.</div></div><div id="snap-state"></div></article>
 
       <article class="card span-6">
         <h2>Discovered nodes</h2>
@@ -88,7 +96,7 @@ def _render_index_html(hostname: str, ports: list[str], now_iso: str) -> str:
       <article class="card span-12"><h2>Management state</h2><p class="muted">Use Manage/Unmanage on discovered nodes to update state.</p></article>
     </section>
   </main>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v={static_version}"></script>
 </body>
 </html>"""
 
@@ -96,11 +104,11 @@ def _render_index_html(hostname: str, ports: list[str], now_iso: str) -> str:
 
 @app.get('/snapshots/{snapshot_id}')
 def snapshot_review_page(snapshot_id: int) -> HTMLResponse:
-    return HTMLResponse(_render_snapshot_review_html(snapshot_id))
+    return HTMLResponse(_render_snapshot_review_html(snapshot_id, _static_version()))
 
 
-def _render_snapshot_review_html(snapshot_id: int) -> str:
-    return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Snapshot #{snapshot_id}</title><link rel='stylesheet' href='/static/styles.css'></head><body><main class='container'><header class='header'><div><h1>Snapshot review #{snapshot_id}</h1><div class='muted'>Human verification required</div></div><a href='/' class='badge'>Back</a></header><section class='card'><div id='review-root'>Loading...</div></section></main><script>window.SNAPSHOT_ID={snapshot_id}</script><script src='/static/app.js'></script></body></html>"""
+def _render_snapshot_review_html(snapshot_id: int, static_version: str) -> str:
+    return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Snapshot #{snapshot_id}</title><link rel='stylesheet' href='/static/styles.css?v={static_version}'></head><body><main class='container'><header class='header'><div><h1>Snapshot review #{snapshot_id}</h1><div class='muted'>Human verification required</div></div><a href='/' class='badge'>Back</a></header><section class='card'><div id='review-root'>Loading...</div><div id='review-status' class='status-box status-warning'>No action yet.</div></section></main><script>window.SNAPSHOT_ID={snapshot_id}</script><script src='/static/app.js?v={static_version}'></script></body></html>"""
 
 @app.get('/api/status')
 def api_status():
@@ -259,4 +267,15 @@ def cleanup(payload: CleanupPayload):
 
     for snap in deleted_snapshots:
         _delete_snapshot_artifacts(snap)
-    return {"ok": True, "deleted_ids": deleted_ids, "preview": _cleanup_preview(payload.older_than_days)}
+    errors: list[str] = []
+    kept_count = max(0, len(snapshots) - len(deleted_ids))
+    return {
+        "ok": True,
+        "mode": payload.mode,
+        "deleted_count": len(deleted_ids),
+        "deleted_ids": deleted_ids,
+        "kept_count": kept_count,
+        "zero_matched": len(deleted_ids) == 0,
+        "errors": errors,
+        "preview": _cleanup_preview(payload.older_than_days),
+    }
