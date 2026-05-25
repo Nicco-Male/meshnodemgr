@@ -4,6 +4,9 @@ import json
 from typing import Any
 
 
+NOT_COLLECTED = "not_collected"
+
+
 def _parse_json_payload(raw: str | None) -> tuple[Any, str | None]:
     if raw is None:
         return None, None
@@ -19,41 +22,9 @@ def _parse_json_payload(raw: str | None) -> tuple[Any, str | None]:
 def _to_node_list(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, list):
         return [n for n in payload if isinstance(n, dict)]
-    if isinstance(payload, dict):
-        nodes = payload.get("nodes")
-        if isinstance(nodes, list):
-            return [n for n in nodes if isinstance(n, dict)]
+    if isinstance(payload, dict) and isinstance(payload.get("nodes"), list):
+        return [n for n in payload["nodes"] if isinstance(n, dict)]
     return []
-
-
-def _is_empty(value: Any) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, (list, dict, str)):
-        return len(value) == 0
-    return False
-
-
-def section_status(collected: bool, parse_error: str | None, value: Any) -> str:
-    if not collected:
-        return "Not collected"
-    if parse_error:
-        return "Parse failed"
-    if _is_empty(value):
-        return "Empty"
-    return "OK"
-
-
-def _reason_for_section(raw_value: str | None, parse_error: str | None, value: Any, *, supported: bool) -> str | None:
-    if not supported:
-        return "Not collected: current CLI flow does not collect this section in full local backup"
-    if raw_value is None:
-        return "Not collected: command not executed"
-    if parse_error:
-        return f"Parse failed: {parse_error}"
-    if _is_empty(value):
-        return "Collected but empty output"
-    return None
 
 
 def normalize_snapshot_payload(
@@ -65,26 +36,16 @@ def normalize_snapshot_payload(
 ) -> dict[str, Any]:
     info_payload, info_err = _parse_json_payload(raw.get("info_no_node"))
     nodes_payload, nodes_err = _parse_json_payload(raw.get("nodes"))
-    config_payload, config_err = _parse_json_payload(raw.get("config"))
-    channels_payload, channels_err = _parse_json_payload(raw.get("channels"))
-    module_payload, module_err = _parse_json_payload(raw.get("module_config"))
+
+    local_device_info: Any = info_payload if isinstance(info_payload, dict) else NOT_COLLECTED
+    nodes: Any = _to_node_list(nodes_payload) if raw.get("nodes") is not None else NOT_COLLECTED
+    export_config: Any = raw.get("export_config") or NOT_COLLECTED
 
     parse_errors: list[str] = []
-    for key, err in (
-        ("info_no_node", info_err),
-        ("nodes", nodes_err),
-        ("config", config_err),
-        ("channels", channels_err),
-        ("module_config", module_err),
-    ):
-        if err:
-            parse_errors.append(f"{key}: {err}")
-
-    local_info = info_payload if isinstance(info_payload, dict) else {}
-    nodes = _to_node_list(nodes_payload)
-    config = config_payload if isinstance(config_payload, dict) else {}
-    channels = channels_payload if isinstance(channels_payload, (dict, list)) else {}
-    module_config = module_payload if isinstance(module_payload, dict) else {}
+    if info_err:
+        parse_errors.append(f"info_no_node: {info_err}")
+    if nodes_err:
+        parse_errors.append(f"nodes: {nodes_err}")
 
     normalized = {
         "source": {
@@ -95,39 +56,18 @@ def normalize_snapshot_payload(
             "short_name": source.get("source_node_short_name"),
             "label": source.get("source_node_label"),
         },
-        "local_info": local_info,
-        "device_info": local_info,
-        "config": config,
-        "channels": channels,
-        "module_config": module_config,
+        "local_device_info": local_device_info,
+        "export_config": export_config,
         "nodes": nodes,
+        "config": NOT_COLLECTED,
+        "channels": NOT_COLLECTED,
+        "module_config": NOT_COLLECTED,
         "raw": {
-            "info_no_node": raw.get("info_no_node") or "",
-            "nodes": raw.get("nodes") or "",
-            "config": raw.get("config") or "",
-            "channels": raw.get("channels") or "",
-            "module_config": raw.get("module_config") or "",
+            "info_no_node": raw.get("info_no_node") if raw.get("info_no_node") is not None else NOT_COLLECTED,
+            "nodes": raw.get("nodes") if raw.get("nodes") is not None else NOT_COLLECTED,
+            "export_config": raw.get("export_config") if raw.get("export_config") is not None else NOT_COLLECTED,
         },
+        "warnings": [],
         "parse_errors": parse_errors,
-        "warnings": [
-            "Config not collected: current CLI flow does not collect config in full local backup.",
-            "Channels not collected: current CLI flow does not collect channels in full local backup.",
-            "Module config not collected: current CLI flow does not collect module config in full local backup.",
-        ],
-        "section_status": {
-            "local_info": section_status(raw.get("info_no_node") is not None, info_err, local_info),
-            "config": section_status(raw.get("config") is not None, config_err, config),
-            "channels": section_status(raw.get("channels") is not None, channels_err, channels),
-            "module_config": section_status(raw.get("module_config") is not None, module_err, module_config),
-            "nodes": section_status(raw.get("nodes") is not None, nodes_err, nodes),
-        },
-        "section_reasons": {
-            "local_info": _reason_for_section(raw.get("info_no_node"), info_err, local_info, supported=True),
-            "device_info": _reason_for_section(raw.get("info_no_node"), info_err, local_info, supported=True),
-            "nodes": _reason_for_section(raw.get("nodes"), nodes_err, nodes, supported=True),
-            "config": _reason_for_section(raw.get("config"), config_err, config, supported=False),
-            "channels": _reason_for_section(raw.get("channels"), channels_err, channels, supported=False),
-            "module_config": _reason_for_section(raw.get("module_config"), module_err, module_config, supported=False),
-        },
     }
     return normalized

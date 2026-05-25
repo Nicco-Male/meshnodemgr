@@ -57,6 +57,11 @@ def _slug(text: str, max_len: int = 80) -> str:
     return n[:max_len] or "unknown-source"
 
 
+def _snapshot_name_from_source(source: dict[str, Any], timestamp: str) -> str:
+    base = source.get("source_node_long_name") or source.get("source_node_short_name") or source.get("source_node_id") or source.get("source_node_num") or "unknown-source"
+    return f"{_slug(str(base))}_{timestamp}_export-config.txt"
+
+
 def test_connection(profile: ConnectionProfile) -> dict[str, Any]:
     if profile.type == "serial":
         ports = list_serial_ports()
@@ -78,46 +83,26 @@ def _mask_sensitive(text: str) -> str:
     return masked
 
 
-def _preview_text(text: str, debug: bool) -> str:
-    safe = _mask_sensitive(text)
-    if debug and len(safe) <= RAW_MAX_DEBUG:
-        return safe
-    if debug and len(safe) > RAW_MAX_DEBUG:
-        return f"{safe[:1500]}\n... [truncated total={len(safe)}] ...\n{safe[-1500:]}"
-    if len(safe) <= 400:
-        return safe
-    return f"{safe[:200]} ... {safe[-200:]}"
-
-
 def run_meshtastic_cli(step_name: str, args: list[str], connection: ConnectionProfile) -> dict[str, Any]:
     cmd = ["meshtastic"]
     if connection.type == "serial":
         cmd += ["--port", connection.serial_port or ""]
-        target = f"serial:{connection.serial_port or ''}"
+        target = connection.serial_port or ""
     else:
         cmd += ["--host", connection.host or "", "--port", str(connection.port or "")]
-        target = f"tcp:{connection.host or ''}:{connection.port or ''}"
+        target = connection.host or ""
     cmd += args
-    debug_mode = os.getenv("MESHNODEMGR_DEBUG") == "1"
-    cmd_str = _mask_sensitive(" ".join(cmd))
-    LOGGER.info("STEP %s | start | connection_type=%s | target=%s | command=%s | started_at=%s", step_name, connection.type, target, cmd_str, datetime.utcnow().isoformat() + "Z")
+    LOGGER.info("CLI run | step=%s | command_name=%s | connection_type=%s | target=%s | command=%s", step_name, " ".join(args), connection.type, target, _mask_sensitive(" ".join(cmd)))
     t0 = time.perf_counter()
-    started_at = datetime.utcnow().isoformat() + "Z"
     try:
         cp = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=25)
         duration_ms = int((time.perf_counter() - t0) * 1000)
-        stdout = cp.stdout or ""
-        stderr = cp.stderr or ""
-        ended_at = datetime.utcnow().isoformat() + "Z"
-        LOGGER.info("STEP %s | done | started_at=%s | ended_at=%s | duration_ms=%s | return_code=%s", step_name, started_at, ended_at, duration_ms, cp.returncode)
-        LOGGER.debug("STEP %s | stdout_preview(first_%s)=%s", step_name, RAW_MAX_DEBUG, _preview_text(stdout[:RAW_MAX_DEBUG], True))
-        LOGGER.debug("STEP %s | stderr_preview(first_%s)=%s", step_name, RAW_MAX_DEBUG, _preview_text(stderr[:RAW_MAX_DEBUG], True))
-        return {"ok": cp.returncode == 0, "step": step_name, "command": cmd, "exit_code": cp.returncode, "duration_ms": duration_ms, "stdout": stdout, "stderr": stderr, "error": None if cp.returncode == 0 else "command_failed"}
+        LOGGER.info("CLI result | step=%s | return_code=%s | stdout_bytes=%s | stderr_bytes=%s | duration_ms=%s", step_name, cp.returncode, len(cp.stdout.encode("utf-8")), len(cp.stderr.encode("utf-8")), duration_ms)
+        return {"ok": cp.returncode == 0, "step": step_name, "command": cmd, "exit_code": cp.returncode, "duration_ms": duration_ms, "stdout": cp.stdout or "", "stderr": cp.stderr or "", "error": None if cp.returncode == 0 else "command_failed"}
     except Exception as exc:
         duration_ms = int((time.perf_counter() - t0) * 1000)
-        err = _mask_sensitive(str(exc))
-        LOGGER.error("STEP %s | failed | started_at=%s | duration_ms=%s | error=%s", step_name, started_at, duration_ms, err)
-        return {"ok": False, "step": step_name, "command": cmd, "exit_code": None, "duration_ms": duration_ms, "stdout": "", "stderr": err, "error": err}
+        LOGGER.error("CLI failed | step=%s | error=%s | duration_ms=%s", step_name, _mask_sensitive(str(exc)), duration_ms)
+        return {"ok": False, "step": step_name, "command": cmd, "exit_code": None, "duration_ms": duration_ms, "stdout": "", "stderr": str(exc), "error": str(exc)}
 
 
 def _normalize_nodes(raw_nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -128,93 +113,51 @@ def _normalize_nodes(raw_nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def _snippet(text: str, size: int = 160) -> tuple[str, str]:
-    t = (text or "").strip()
-    return (t[:size], t[-size:]) if len(t) > size else (t, t)
-
-
-def _build_logs(steps: dict[str, dict[str, Any]], normalized: dict[str, Any]) -> list[dict[str, Any]]:
-    map_sec = {"local_info_raw": "local_info", "nodes_raw": "nodes", "config_raw": "config", "channels_raw": "channels", "module_config_raw": "module_config"}
-    logs = []
-    for key, sec in map_sec.items():
-        st = steps[key]
-        h, t = _snippet(st.get("stdout") or "")
-        eh, et = _snippet(st.get("stderr") or "")
-        logs.append({"section": sec, "command": " ".join(st.get("command") or []), "duration_ms": st.get("duration_ms"), "exit_code": st.get("exit_code"), "output_head": h, "output_tail": t, "stderr_head": eh, "stderr_tail": et, "parser_error": next((e for e in normalized.get("parse_errors", []) if sec in e or (sec=="local_info" and "info_no_node" in e)), None), "section_saved": normalized.get("section_status", {}).get(sec), "section_reason": normalized.get("section_reasons", {}).get(sec), "step_error": st.get("error")})
-    return logs
-
-
 def run_local_backup(profile: ConnectionProfile) -> dict[str, Any]:
     now = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    profile_view = {"type": profile.type, "serial_port": profile.serial_port if profile.type == "serial" else None, "host": profile.host if profile.type == "tcp" else None, "port": profile.port if profile.type == "tcp" else None}
-    LOGGER.info("BACKUP local | start | profile=%s", _mask_sensitive(json.dumps(profile_view, ensure_ascii=False)))
-    steps = {
-        "local_info_raw": run_meshtastic_cli("full_backup_local_info", ["--info", "--no-node"], profile),
-        "nodes_raw": run_meshtastic_cli("full_backup_nodes", ["--nodes"], profile),
-        "config_raw": {"ok": False, "command": ["not-executed"], "exit_code": None, "duration_ms": 0, "stdout": "", "stderr": "", "error": "not_implemented_yet"},
-        "channels_raw": {"ok": False, "command": ["not-executed"], "exit_code": None, "duration_ms": 0, "stdout": "", "stderr": "", "error": "not_implemented_yet"},
-        "module_config_raw": {"ok": False, "command": ["not-executed"], "exit_code": None, "duration_ms": 0, "stdout": "", "stderr": "", "error": "not_implemented_yet"},
-    }
-    raw = {
-        "local_info_raw": steps["local_info_raw"].get("stdout") if steps["local_info_raw"].get("ok") else None,
-        "nodes_raw": steps["nodes_raw"].get("stdout") if steps["nodes_raw"].get("ok") else None,
-        "config_raw": None,
-        "channels_raw": None,
-        "module_config_raw": None,
-    }
+    export_step = run_meshtastic_cli("full_backup_export_config", ["--export-config"], profile)
+    if not export_step.get("ok"):
+        raise RuntimeError("export-config command failed")
+    export_text = (export_step.get("stdout") or "").strip()
+    if not export_text:
+        raise RuntimeError("export-config produced empty output")
+
+    local_step = run_meshtastic_cli("full_backup_local_info", ["--info", "--no-node"], profile)
     local_info = {}
-    if raw["local_info_raw"]:
-        try: local_info = json.loads(raw["local_info_raw"])
-        except Exception: local_info = {}
+    if local_step.get("ok") and local_step.get("stdout", "").strip():
+        try:
+            local_info = json.loads(local_step["stdout"])
+        except Exception:
+            local_info = {}
     source = _normalize_source(_safe_json(local_info))
-    folder_name = f"{now}-{_slug(source.get('source_node_short_name') or '')}-{_slug(source.get('source_node_long_name') or '')}".strip("-")
-    backup_dir = Path("data") / "backups" / (folder_name or f"{now}-unknown-source")
+
+    backup_dir = Path("data") / "backups" / f"{now}-local"
     backup_dir.mkdir(parents=True, exist_ok=True)
-    raw_map = {"info_no_node": raw["local_info_raw"], "nodes": raw["nodes_raw"], "config": raw["config_raw"], "channels": raw["channels_raw"], "module_config": raw["module_config_raw"]}
+    export_filename = _snapshot_name_from_source(source, now)
+    export_path = backup_dir / export_filename
+    export_path.write_text(export_text + "\n", encoding="utf-8")
+    LOGGER.info("CLI file | step=full_backup_export_config | output_path=%s", str(export_path))
+
     target = profile.serial_port if profile.type == "serial" else f"{profile.host}:{profile.port}"
-    normalized = normalize_snapshot_payload(connection_type=profile.type, connection_target=target, source=source, raw=raw_map)
-    LOGGER.info("STEP parser_result | local_info=%s | nodes=%s", normalized.get("section_status", {}).get("local_info"), normalized.get("section_status", {}).get("nodes"))
-    LOGGER.info("STEP parser_counts | local_info_keys=%s | node_count=%s | parse_errors=%s", len((normalized.get("local_info") or {}).keys()), len(normalized.get("nodes") or []), len(normalized.get("parse_errors") or []))
-    statuses = normalized.get("section_status", {})
-    ok_count = sum(1 for v in statuses.values() if v == "OK")
-    normalized["status"] = "ok" if ok_count == len(statuses) else "partial" if ok_count > 0 else "failed"
+    normalized = normalize_snapshot_payload(connection_type=profile.type, connection_target=target, source=source, raw={"info_no_node": local_step.get("stdout") if local_step.get("ok") else None, "nodes": None, "config": None, "channels": None, "module_config": None, "export_config": str(export_path)})
+    normalized["status"] = "ok"
     normalized["snapshot_time"] = now
-    normalized["node_count"] = len(normalized.get("nodes", []))
-    logs = _build_logs(steps, normalized)
-    normalized["command_logs"] = logs
-    for item in logs:
-        LOGGER.info("STEP section=%s | status=%s | reason=%s | command=%s | exit_code=%s", item["section"], item.get("section_saved"), item.get("section_reason") or item.get("step_error") or "none", item.get("command"), item.get("exit_code"))
-    metadata = {"timestamp": now, "connection": _safe_json(profile.__dict__), "command_logs": logs}
-    command_summary = [
-        {"step": "full_backup_local_info", "command": _mask_sensitive(" ".join(steps["local_info_raw"].get("command") or [])), "return_code": steps["local_info_raw"].get("exit_code"), "duration": steps["local_info_raw"].get("duration_ms"), "stdout_len": len(steps["local_info_raw"].get("stdout") or ""), "stderr_len": len(steps["local_info_raw"].get("stderr") or ""), "parser_status": normalized.get("section_status", {}).get("local_info")},
-        {"step": "full_backup_nodes", "command": _mask_sensitive(" ".join(steps["nodes_raw"].get("command") or [])), "return_code": steps["nodes_raw"].get("exit_code"), "duration": steps["nodes_raw"].get("duration_ms"), "stdout_len": len(steps["nodes_raw"].get("stdout") or ""), "stderr_len": len(steps["nodes_raw"].get("stderr") or ""), "parser_status": normalized.get("section_status", {}).get("nodes")},
-    ]
-    for filename, payload in {
-        "local_info_stdout.txt": steps["local_info_raw"].get("stdout") or "",
-        "local_info_stderr.txt": steps["local_info_raw"].get("stderr") or "",
-        "nodes_stdout.txt": steps["nodes_raw"].get("stdout") or "",
-        "nodes_stderr.txt": steps["nodes_raw"].get("stderr") or "",
-        "command_summary.json": command_summary,
-        "metadata.json": metadata,
-        "normalized.json": normalized,
-    }.items():
-        (backup_dir / filename).write_text(payload if isinstance(payload, str) else json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    useful = any(statuses.get(k) == "OK" for k in ("local_info", "nodes"))
-    if not useful:
-        LOGGER.warning("STEP snapshot_save | skipped | reason=no_useful_data | backup_dir=%s | details=%s", backup_dir, json.dumps(logs, ensure_ascii=False)[:RAW_MAX_DEBUG])
-        raise RuntimeError("No useful data collected. Step errors: " + "; ".join([f"{l['section']}:{l.get('section_reason') or l.get('step_error') or l.get('parser_error') or 'empty'}" for l in logs]))
-    LOGGER.info("BACKUP local | end | backup_dir=%s | status=%s | node_count=%s", backup_dir, normalized["status"], normalized["node_count"])
-    return {"normalized": normalized, "backup_dir": str(backup_dir), "raw_path": str(backup_dir / "metadata.json"), "normalized_path": str(backup_dir / "normalized.json")}
+    normalized["node_count"] = 0
+
+    metadata = {"timestamp": now, "connection": _safe_json(profile.__dict__), "export_file": str(export_path)}
+    (backup_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+    (backup_dir / "normalized.json").write_text(json.dumps(normalized, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    return {"normalized": normalized, "backup_dir": str(backup_dir), "raw_path": str(backup_dir / "metadata.json"), "normalized_path": str(backup_dir / "normalized.json"), "export_path": str(export_path)}
 
 
 def persist_discovery_snapshot(profile: ConnectionProfile, read: dict[str, Any]) -> dict[str, str]:
     now = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     source = read.get("source_node") or {}
-    folder_name = f"{now}-{_slug(source.get('source_node_short_name') or "")}-{_slug(source.get('source_node_long_name') or "")}".strip("-")
-    backup_dir = Path("data") / "backups" / (folder_name or f"{now}-unknown-source")
+    backup_dir = Path("data") / "backups" / f"{now}-nodes"
     backup_dir.mkdir(parents=True, exist_ok=True)
     target = profile.serial_port if profile.type == "serial" else f"{profile.host}:{profile.port}"
-    raw_map = {"info_no_node": json.dumps(read.get("source_node") or {}, ensure_ascii=False), "nodes": json.dumps(read.get("nodes_raw") or [], ensure_ascii=False), "config": None, "channels": None, "module_config": None}
+    raw_map = {"info_no_node": None, "nodes": json.dumps(read.get("nodes_raw") or [], ensure_ascii=False), "config": None, "channels": None, "module_config": None, "export_config": None}
     normalized = normalize_snapshot_payload(connection_type=profile.type, connection_target=target, source=source, raw=raw_map)
     normalized["status"] = "partial" if normalized.get("nodes") else "failed"
     normalized["snapshot_time"] = now
@@ -226,30 +169,28 @@ def persist_discovery_snapshot(profile: ConnectionProfile, read: dict[str, Any])
 
 def read_local_node(profile: ConnectionProfile) -> dict[str, Any]:
     step = run_meshtastic_cli("local_info", ["--info", "--no-node"], profile)
+    if not step.get("ok"):
+        raise RuntimeError(step.get("error") or "local_info_failed")
     parsed = {}
-    perr = None
-    if step.get("ok") and step.get("stdout", "").strip():
-        try: parsed = json.loads(step["stdout"])
-        except Exception as exc: perr = str(exc)
+    if step.get("stdout", "").strip():
+        try:
+            parsed = json.loads(step["stdout"])
+        except Exception:
+            parsed = {}
     source = _normalize_source(_safe_json(parsed))
-    LOGGER.info("STEP parser_result | local_info_parser=%s", "ok" if not perr else f"error:{perr}")
-    return {"ok": True, "source_node": source, "command_log": {"command": " ".join(step.get("command") or []), "duration_ms": step.get("duration_ms"), "exit_code": step.get("exit_code"), "parser_error": perr, "step_error": step.get("error")}}
+    return {"ok": True, "source_node": source, "local_device_info": parsed, "command_log": {"command": " ".join(step.get("command") or []), "duration_ms": step.get("duration_ms"), "exit_code": step.get("exit_code"), "step_error": step.get("error")}}
 
 
 def read_discovered_nodes(profile: ConnectionProfile) -> dict[str, Any]:
-    info_step = run_meshtastic_cli("local_info", ["--info", "--no-node"], profile)
     nodes_step = run_meshtastic_cli("nodes", ["--nodes"], profile)
-    source = {}
-    if info_step.get("ok") and info_step.get("stdout", "").strip():
-        try: source = _normalize_source(_safe_json(json.loads(info_step["stdout"])))
-        except Exception: source = {}
+    if not nodes_step.get("ok"):
+        raise RuntimeError(nodes_step.get("error") or "nodes_failed")
     payload = []
-    if nodes_step.get("ok") and nodes_step.get("stdout", "").strip():
+    if nodes_step.get("stdout", "").strip():
         try:
             parsed = json.loads(nodes_step["stdout"])
             payload = parsed if isinstance(parsed, list) else parsed.get("nodes", []) if isinstance(parsed, dict) else []
         except Exception:
             payload = []
     nodes = _normalize_nodes([n for n in payload if isinstance(n, dict)])
-    LOGGER.info("STEP parser_result | nodes_parser=%s | node_count=%s", "ok" if payload else "empty_or_parse_error", len(nodes))
-    return {"ok": True, "source_node": source, "node_count": len(nodes), "nodes": nodes, "nodes_raw": payload}
+    return {"ok": True, "source_node": {}, "node_count": len(nodes), "nodes": nodes, "nodes_raw": payload}
