@@ -160,6 +160,39 @@ def run_local_backup(profile: ConnectionProfile) -> dict[str, Any]:
     return {"normalized": normalized, "backup_dir": str(backup_dir), "raw_path": str(backup_dir / "metadata.json"), "normalized_path": str(backup_dir / "normalized.json")}
 
 
+
+def persist_discovery_snapshot(profile: ConnectionProfile, read: dict[str, Any]) -> dict[str, str]:
+    now = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    source = _normalize_source(_safe_json(read.get("local_info") or read.get("local_node") or {}))
+    folder_name = f"{now}-{_slug(source.get('source_node_short_name') or '')}-{_slug(source.get('source_node_long_name') or '')}".strip("-")
+    backup_dir = Path("data") / "backups" / (folder_name or f"{now}-unknown-source")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    normalized = {
+        "snapshot_time": now,
+        "connection_type": profile.type,
+        "connection_target": profile.serial_port if profile.type == "serial" else f"{profile.host}:{profile.port}",
+        "source_node": source,
+        "local_node": _safe_json(read.get("local_info") or read.get("local_node") or {}),
+        "node_count": len(read.get("normalized_nodes", [])),
+        "nodes": read.get("normalized_nodes", []),
+        "channels": _safe_json(read.get("channels_raw") or []),
+        "config": _safe_json((read.get("config_raw") or {}).get("localConfig") if isinstance(read.get("config_raw"), dict) else {}),
+        "module_config": _safe_json((read.get("config_raw") or {}).get("moduleConfig") if isinstance(read.get("config_raw"), dict) else {}),
+        "status": "nodes_read",
+        "errors": [],
+        "warnings": read.get("warnings", []),
+    }
+    metadata = {
+        "timestamp": now,
+        "connection": _safe_json(profile.__dict__),
+        "status": "nodes_read",
+        "errors": [],
+        "warnings": read.get("warnings", []),
+    }
+    (backup_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+    (backup_dir / "normalized.json").write_text(json.dumps(normalized, indent=2, ensure_ascii=False), encoding="utf-8")
+    return {"raw_path": str(backup_dir / "metadata.json"), "normalized_path": str(backup_dir / "normalized.json"), "backup_dir": str(backup_dir)}
+
 def read_local_node(profile: ConnectionProfile) -> dict[str, Any]:
     read = _read_all(profile)
     source = _normalize_source(_safe_json(read.get("local_info") or read.get("local_node") or {}))
@@ -169,4 +202,4 @@ def read_local_node(profile: ConnectionProfile) -> dict[str, Any]:
 def read_discovered_nodes(profile: ConnectionProfile) -> dict[str, Any]:
     read = _read_all(profile)
     source = _normalize_source(_safe_json(read.get("local_info") or read.get("local_node") or {}))
-    return {"ok": True, "source_node": source, "node_count": len(read["normalized_nodes"]), "nodes": read["normalized_nodes"], "nodes_raw": read["nodes_raw"]}
+    return {"ok": True, "source_node": source, "node_count": len(read["normalized_nodes"]), "nodes": read["normalized_nodes"], "nodes_raw": read["nodes_raw"], "read": read}
