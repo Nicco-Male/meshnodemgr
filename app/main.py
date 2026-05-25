@@ -10,9 +10,9 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app.db import create_snapshot_record, delete_snapshot, delete_snapshots_failed_or_empty, delete_snapshots_unverified, ensure_snapshot_columns, get_snapshot, init_db, insert_snapshot_nodes, list_nodes, list_snapshots, reject_snapshot, verify_snapshot
+from app.db import create_snapshot_record, delete_snapshot, ensure_snapshot_columns, get_snapshot, init_db, insert_snapshot_nodes, list_nodes, list_snapshots, reject_snapshot, verify_snapshot
 from app.services.serial_service import list_serial_ports
-from app.services.meshtastic_service import ConnectionProfile, build_api_error, read_discovered_nodes, read_local_node, run_local_backup, test_connection
+from app.services.meshtastic_service import ConnectionProfile, build_api_error, persist_discovery_snapshot, read_discovered_nodes, read_local_node, run_local_backup, test_connection
 
 app = FastAPI(title="PiAns Mesh Node Manager")
 app.mount("/static", StaticFiles(directory=Path(__file__).resolve().parent / "static"), name="static")
@@ -77,7 +77,7 @@ def _render_index_html(hostname: str, ports: list[str], now_iso: str) -> str:
         <div id="backup-status" class="status-box">No backup running.</div>
       </article>
       <article class="card span-6"><h2>Local node summary</h2><div id="local-node-summary" class="muted"></div></article>
-      <article class="card span-6"><h2>Snapshots / verification</h2><div class="actions"><button id="cleanup-unverified">Delete unverified</button><button id="cleanup-empty">Delete failed/empty</button></div><div id="snap-state"></div></article>
+      <article class="card span-6"><h2>Snapshots / verification</h2><div class="actions"><button id="cleanup-unverified">Delete unverified</button><button id="cleanup-empty">Delete failed/empty</button></div><div class='cleanup-age'><label>Cleanup older than days</label><input id='cleanup-days' type='number' min='1' value='30'><button id='cleanup-older'>Cleanup by age</button><div id='cleanup-preview' class='muted'></div></div><div id="snap-state"></div></article>
 
       <article class="card span-6">
         <h2>Discovered nodes</h2>
@@ -126,7 +126,8 @@ def api_read_local(payload: ConnectionTestRequest):
 def api_read_discovered(payload: ConnectionTestRequest):
     try:
         profile = _to_profile(payload); result = read_discovered_nodes(profile)
-        snap_id = create_snapshot_record({"connection_type": profile.type, "connection_target": profile.serial_port if profile.type=='serial' else f"{profile.host}:{profile.port}", "status": "nodes_read", "raw_path": "", "normalized_path": "", "local_node_id": result['source_node'].get('source_node_id') or str(result['source_node'].get('source_node_num') or ''), "local_node_name": result['source_node'].get('source_node_label'), "node_count": result['node_count'], "source_node_short_name": result['source_node'].get('source_node_short_name'), "source_node_hw_model": result['source_node'].get('source_node_hw_model')})
+        persisted = persist_discovery_snapshot(profile, result['read'])
+        snap_id = create_snapshot_record({"connection_type": profile.type, "connection_target": profile.serial_port if profile.type=='serial' else f"{profile.host}:{profile.port}", "status": "nodes_read", "raw_path": persisted['raw_path'], "normalized_path": persisted['normalized_path'], "local_node_id": result['source_node'].get('source_node_id') or str(result['source_node'].get('source_node_num') or ''), "local_node_name": result['source_node'].get('source_node_label'), "node_count": result['node_count'], "source_node_short_name": result['source_node'].get('source_node_short_name'), "source_node_hw_model": result['source_node'].get('source_node_hw_model')})
         insert_snapshot_nodes(snap_id, result['nodes'])
         result['snapshot_id']=snap_id
         return result
@@ -166,35 +167,96 @@ def api_reject_snapshot(snapshot_id: int, payload: VerifyPayload):
     if not reject_snapshot(snapshot_id, payload.note): raise HTTPException(status_code=404, detail='snapshot_not_found')
     return {"ok": True, "snapshot": get_snapshot(snapshot_id)}
 
-def _cleanup_preview():
-    backups = Path('data/backups'); backups.mkdir(parents=True, exist_ok=True)
+def _snapshot_paths(snapshot: dict) -> list[Path]:
+    out: list[Path] = []
+    for key in ("raw_path", "normalized_path"):
+        value = snapshot.get(key)
+        if value:
+            out.append(Path(value))
+    return out
+
+
+def _snapshot_backup_dir(snapshot: dict) -> Path | None:
+    for path in _snapshot_paths(snapshot):
+        candidate = path.parent
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return None
+
+
+def _cleanup_preview(older_than_days: int | None = None):
+    backups = Path('data/backups')
+    backups.mkdir(parents=True, exist_ok=True)
     snaps = list_snapshots()
     unverified = [s for s in snaps if int(s.get('verified') or 0) == 0]
     failed_or_empty = [s for s in snaps if s.get('status') == 'failed' or (int(s.get('node_count') or 0) == 0 and int(s.get('verified') or 0) == 0)]
-    return {"counts": {"all": len(snaps), "unverified": len(unverified), "failed_or_empty": len(failed_or_empty)}}
+    older_ids: list[int] = []
+    if older_than_days is not None:
+        cutoff = datetime.utcnow().timestamp() - (older_than_days * 86400)
+        for s in snaps:
+            created = datetime.fromisoformat((s.get('created_at') or '').replace(' ', 'T')).timestamp() if s.get('created_at') else 0
+            if created and created < cutoff:
+                older_ids.append(int(s['id']))
+    return {
+        "counts": {
+            "all": len(snaps),
+            "unverified": len(unverified),
+            "failed_or_empty": len(failed_or_empty),
+            "older_than_days": len(older_ids),
+        }
+    }
+
+
+def _delete_snapshot_artifacts(snapshot: dict) -> None:
+    for path in _snapshot_paths(snapshot):
+        if path.exists() and path.is_file():
+            path.unlink(missing_ok=True)
+    backup_dir = _snapshot_backup_dir(snapshot)
+    if backup_dir and backup_dir.exists() and backup_dir.is_dir():
+        import shutil
+        shutil.rmtree(backup_dir, ignore_errors=True)
+
+    root = Path('data/backups')
+    if root.exists():
+        for child in root.iterdir():
+            if child.is_dir() and not any(child.iterdir()):
+                child.rmdir()
+
 
 @app.post('/api/snapshots/cleanup')
 def cleanup(payload: CleanupPayload):
     if payload.mode == 'preview':
-        return {"ok": True, "preview": _cleanup_preview()}
+        return {"ok": True, "preview": _cleanup_preview(payload.older_than_days)}
     if not payload.confirm:
         raise HTTPException(status_code=400, detail='confirmation_required')
+
     deleted_ids: list[int] = []
+    deleted_snapshots: list[dict] = []
+    snapshots = list_snapshots()
+
     if payload.mode == 'single' and payload.snapshot_id:
-        if delete_snapshot(payload.snapshot_id):
-            deleted_ids = [payload.snapshot_id]
+        target = get_snapshot(payload.snapshot_id)
+        if target and delete_snapshot(payload.snapshot_id):
+            deleted_ids.append(payload.snapshot_id)
+            deleted_snapshots.append(target)
     elif payload.mode == 'unverified':
-        deleted_ids = delete_snapshots_unverified()
+        for s in snapshots:
+            if int(s.get('verified') or 0) == 0 and delete_snapshot(int(s['id'])):
+                deleted_ids.append(int(s['id']))
+                deleted_snapshots.append(s)
     elif payload.mode == 'failed_or_empty':
-        deleted_ids = delete_snapshots_failed_or_empty()
+        for s in snapshots:
+            if (s.get('status') == 'failed' or (int(s.get('node_count') or 0) == 0 and int(s.get('verified') or 0) == 0)) and delete_snapshot(int(s['id'])):
+                deleted_ids.append(int(s['id']))
+                deleted_snapshots.append(s)
     elif payload.mode == 'older_than_days' and payload.older_than_days is not None:
         cutoff = datetime.utcnow().timestamp() - (payload.older_than_days * 86400)
-        for s in list_snapshots():
+        for s in snapshots:
             created = datetime.fromisoformat((s.get('created_at') or '').replace(' ', 'T')).timestamp() if s.get('created_at') else 0
             if created and created < cutoff and delete_snapshot(int(s['id'])):
                 deleted_ids.append(int(s['id']))
-    for snap in deleted_ids:
-        for fp in [Path('data/backups') / str(snap)]:
-            if fp.exists() and fp.is_dir():
-                import shutil; shutil.rmtree(fp, ignore_errors=True)
-    return {"ok": True, "deleted_ids": deleted_ids, "preview": _cleanup_preview()}
+                deleted_snapshots.append(s)
+
+    for snap in deleted_snapshots:
+        _delete_snapshot_artifacts(snap)
+    return {"ok": True, "deleted_ids": deleted_ids, "preview": _cleanup_preview(payload.older_than_days)}
