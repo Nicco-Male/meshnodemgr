@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import socket
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +18,11 @@ from app.services.meshtastic_service import ConnectionProfile, build_api_error, 
 
 app = FastAPI(title="PiAns Mesh Node Manager")
 app.mount("/static", StaticFiles(directory=Path(__file__).resolve().parent / "static"), name="static")
+
+
+def _configure_logging() -> None:
+    level = logging.DEBUG if os.getenv("MESHNODEMGR_DEBUG") == "1" else logging.INFO
+    logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
 class ConnectionTestRequest(BaseModel):
     type: str = Field(pattern="^(serial|tcp)$")
@@ -38,6 +45,7 @@ def _to_profile(payload: ConnectionTestRequest) -> ConnectionProfile:
 
 @app.on_event("startup")
 def on_startup() -> None:
+    _configure_logging()
     init_db(); ensure_snapshot_columns()
 
 @app.get("/")
