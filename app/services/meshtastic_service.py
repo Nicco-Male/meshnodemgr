@@ -100,7 +100,7 @@ def run_meshtastic_cli(step_name: str, args: list[str], connection: ConnectionPr
     cmd += args
     debug_mode = os.getenv("MESHNODEMGR_DEBUG") == "1"
     cmd_str = _mask_sensitive(" ".join(cmd))
-    LOGGER.info("STEP %s | start | connection_type=%s | target=%s | command=%s", step_name, connection.type, target, cmd_str)
+    LOGGER.info("STEP %s | start | connection_type=%s | target=%s | command=%s | started_at=%s", step_name, connection.type, target, cmd_str, datetime.utcnow().isoformat() + "Z")
     t0 = time.perf_counter()
     started_at = datetime.utcnow().isoformat() + "Z"
     try:
@@ -108,12 +108,10 @@ def run_meshtastic_cli(step_name: str, args: list[str], connection: ConnectionPr
         duration_ms = int((time.perf_counter() - t0) * 1000)
         stdout = cp.stdout or ""
         stderr = cp.stderr or ""
-        LOGGER.info(
-            "STEP %s | done | started_at=%s | duration_ms=%s | return_code=%s | stdout_len=%s | stderr_len=%s",
-            step_name, started_at, duration_ms, cp.returncode, len(stdout), len(stderr),
-        )
-        LOGGER.debug("STEP %s | stdout_preview=%s", step_name, _preview_text(stdout, debug_mode))
-        LOGGER.debug("STEP %s | stderr_preview=%s", step_name, _preview_text(stderr, debug_mode))
+        ended_at = datetime.utcnow().isoformat() + "Z"
+        LOGGER.info("STEP %s | done | started_at=%s | ended_at=%s | duration_ms=%s | return_code=%s", step_name, started_at, ended_at, duration_ms, cp.returncode)
+        LOGGER.debug("STEP %s | stdout_preview(first_%s)=%s", step_name, RAW_MAX_DEBUG, _preview_text(stdout[:RAW_MAX_DEBUG], True))
+        LOGGER.debug("STEP %s | stderr_preview(first_%s)=%s", step_name, RAW_MAX_DEBUG, _preview_text(stderr[:RAW_MAX_DEBUG], True))
         return {"ok": cp.returncode == 0, "step": step_name, "command": cmd, "exit_code": cp.returncode, "duration_ms": duration_ms, "stdout": stdout, "stderr": stderr, "error": None if cp.returncode == 0 else "command_failed"}
     except Exception as exc:
         duration_ms = int((time.perf_counter() - t0) * 1000)
@@ -148,12 +146,14 @@ def _build_logs(steps: dict[str, dict[str, Any]], normalized: dict[str, Any]) ->
 
 def run_local_backup(profile: ConnectionProfile) -> dict[str, Any]:
     now = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    profile_view = {"type": profile.type, "serial_port": profile.serial_port if profile.type == "serial" else None, "host": profile.host if profile.type == "tcp" else None, "port": profile.port if profile.type == "tcp" else None}
+    LOGGER.info("BACKUP local | start | profile=%s", _mask_sensitive(json.dumps(profile_view, ensure_ascii=False)))
     steps = {
         "local_info_raw": run_meshtastic_cli("full_backup_local_info", ["--info", "--no-node"], profile),
         "nodes_raw": run_meshtastic_cli("full_backup_nodes", ["--nodes"], profile),
-        "config_raw": {"ok": False, "command": [], "exit_code": None, "duration_ms": 0, "stdout": "", "stderr": "", "error": "not_collected_in_current_cli_flow"},
-        "channels_raw": {"ok": False, "command": [], "exit_code": None, "duration_ms": 0, "stdout": "", "stderr": "", "error": "not_collected_in_current_cli_flow"},
-        "module_config_raw": {"ok": False, "command": [], "exit_code": None, "duration_ms": 0, "stdout": "", "stderr": "", "error": "not_collected_in_current_cli_flow"},
+        "config_raw": {"ok": False, "command": ["not-executed"], "exit_code": None, "duration_ms": 0, "stdout": "", "stderr": "", "error": "not_implemented_yet"},
+        "channels_raw": {"ok": False, "command": ["not-executed"], "exit_code": None, "duration_ms": 0, "stdout": "", "stderr": "", "error": "not_implemented_yet"},
+        "module_config_raw": {"ok": False, "command": ["not-executed"], "exit_code": None, "duration_ms": 0, "stdout": "", "stderr": "", "error": "not_implemented_yet"},
     }
     raw = {
         "local_info_raw": steps["local_info_raw"].get("stdout") if steps["local_info_raw"].get("ok") else None,
@@ -174,6 +174,7 @@ def run_local_backup(profile: ConnectionProfile) -> dict[str, Any]:
     target = profile.serial_port if profile.type == "serial" else f"{profile.host}:{profile.port}"
     normalized = normalize_snapshot_payload(connection_type=profile.type, connection_target=target, source=source, raw=raw_map)
     LOGGER.info("STEP parser_result | local_info=%s | nodes=%s", normalized.get("section_status", {}).get("local_info"), normalized.get("section_status", {}).get("nodes"))
+    LOGGER.info("STEP parser_counts | local_info_keys=%s | node_count=%s | parse_errors=%s", len((normalized.get("local_info") or {}).keys()), len(normalized.get("nodes") or []), len(normalized.get("parse_errors") or []))
     statuses = normalized.get("section_status", {})
     ok_count = sum(1 for v in statuses.values() if v == "OK")
     normalized["status"] = "ok" if ok_count == len(statuses) else "partial" if ok_count > 0 else "failed"
@@ -181,6 +182,8 @@ def run_local_backup(profile: ConnectionProfile) -> dict[str, Any]:
     normalized["node_count"] = len(normalized.get("nodes", []))
     logs = _build_logs(steps, normalized)
     normalized["command_logs"] = logs
+    for item in logs:
+        LOGGER.info("STEP section=%s | status=%s | reason=%s | command=%s | exit_code=%s", item["section"], item.get("section_saved"), item.get("section_reason") or item.get("step_error") or "none", item.get("command"), item.get("exit_code"))
     metadata = {"timestamp": now, "connection": _safe_json(profile.__dict__), "command_logs": logs}
     command_summary = [
         {"step": "full_backup_local_info", "command": _mask_sensitive(" ".join(steps["local_info_raw"].get("command") or [])), "return_code": steps["local_info_raw"].get("exit_code"), "duration": steps["local_info_raw"].get("duration_ms"), "stdout_len": len(steps["local_info_raw"].get("stdout") or ""), "stderr_len": len(steps["local_info_raw"].get("stderr") or ""), "parser_status": normalized.get("section_status", {}).get("local_info")},
@@ -198,9 +201,9 @@ def run_local_backup(profile: ConnectionProfile) -> dict[str, Any]:
         (backup_dir / filename).write_text(payload if isinstance(payload, str) else json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     useful = any(statuses.get(k) == "OK" for k in ("local_info", "nodes"))
     if not useful:
-        LOGGER.warning("STEP snapshot_save | skipped | reason=no_useful_data | backup_dir=%s", backup_dir)
+        LOGGER.warning("STEP snapshot_save | skipped | reason=no_useful_data | backup_dir=%s | details=%s", backup_dir, json.dumps(logs, ensure_ascii=False)[:RAW_MAX_DEBUG])
         raise RuntimeError("No useful data collected. Step errors: " + "; ".join([f"{l['section']}:{l.get('section_reason') or l.get('step_error') or l.get('parser_error') or 'empty'}" for l in logs]))
-    LOGGER.info("STEP snapshot_save | backup_dir=%s", backup_dir)
+    LOGGER.info("BACKUP local | end | backup_dir=%s | status=%s | node_count=%s", backup_dir, normalized["status"], normalized["node_count"])
     return {"normalized": normalized, "backup_dir": str(backup_dir), "raw_path": str(backup_dir / "metadata.json"), "normalized_path": str(backup_dir / "normalized.json")}
 
 
