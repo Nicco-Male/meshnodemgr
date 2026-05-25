@@ -134,7 +134,7 @@ def api_read_local(payload: ConnectionTestRequest):
 def api_read_discovered(payload: ConnectionTestRequest):
     try:
         profile = _to_profile(payload); result = read_discovered_nodes(profile)
-        persisted = persist_discovery_snapshot(profile, result['read'])
+        persisted = persist_discovery_snapshot(profile, result)
         snap_id = create_snapshot_record({"connection_type": profile.type, "connection_target": profile.serial_port if profile.type=='serial' else f"{profile.host}:{profile.port}", "status": "nodes_read", "raw_path": persisted['raw_path'], "normalized_path": persisted['normalized_path'], "local_node_id": result['source_node'].get('source_node_id') or str(result['source_node'].get('source_node_num') or ''), "local_node_name": result['source_node'].get('source_node_label'), "node_count": result['node_count'], "source_node_short_name": result['source_node'].get('source_node_short_name'), "source_node_hw_model": result['source_node'].get('source_node_hw_model')})
         insert_snapshot_nodes(snap_id, result['nodes'])
         result['snapshot_id']=snap_id
@@ -145,8 +145,8 @@ def api_read_discovered(payload: ConnectionTestRequest):
 @app.post('/api/backups/local')
 def api_backup_local(payload: ConnectionTestRequest):
     try:
-        result = run_local_backup(_to_profile(payload)); n=result['normalized']; s=n['source_node']
-        snap_id=create_snapshot_record({"connection_type": n['connection_type'], "connection_target": n['connection_target'], "status": n['status'], "raw_path": result['raw_path'], "normalized_path": result['normalized_path'], "local_node_id": s.get('source_node_id') or str(s.get('source_node_num') or ''), "local_node_name": s.get('source_node_label') or s.get('source_node_long_name') or s.get('source_node_short_name'), "node_count": n['node_count'], "source_node_short_name": s.get('source_node_short_name'), "source_node_hw_model": s.get('source_node_hw_model')})
+        result = run_local_backup(_to_profile(payload)); n=result['normalized']; s=n['source']
+        snap_id=create_snapshot_record({"connection_type": n["source"]["connection_type"], "connection_target": n["source"]["connection_target"], "status": n['status'], "raw_path": result['raw_path'], "normalized_path": result['normalized_path'], "local_node_id": s.get('node_id') or '', "local_node_name": s.get('label') or s.get('long_name') or s.get('short_name'), "node_count": n['node_count'], "source_node_short_name": s.get('short_name'), "source_node_hw_model": None})
         insert_snapshot_nodes(snap_id, n['nodes'])
         return {"ok": True, "snapshot_id": snap_id, "snapshot": get_snapshot(snap_id), "backup": result}
     except Exception as exc:
