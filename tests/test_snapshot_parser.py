@@ -1,13 +1,14 @@
-from app.services.snapshot_parser import normalize_snapshot_payload
+from app.services.snapshot_parser import NOT_COLLECTED, normalize_snapshot_payload
 
 
-def test_separates_info_no_node_from_nodes():
+def test_maps_sections_explicitly():
     raw = {
         "info_no_node": '{"user":{"id":"!abcd","longName":"Nicco Pisa Berry II","shortName":"NPBe"}}',
         "nodes": '[{"num":123,"user":{"id":"!n1","longName":"Node 1","shortName":"N1"}}]',
         "config": None,
         "channels": None,
         "module_config": None,
+        "export_config": "data/backups/20260525-local/NPBe_20260525-171530_export-config.txt",
     }
     normalized = normalize_snapshot_payload(
         connection_type="tcp",
@@ -16,19 +17,21 @@ def test_separates_info_no_node_from_nodes():
         raw=raw,
     )
 
-    assert normalized["local_info"]["user"]["id"] == "!abcd"
+    assert normalized["local_device_info"]["user"]["id"] == "!abcd"
     assert len(normalized["nodes"]) == 1
     assert normalized["nodes"][0]["user"]["id"] == "!n1"
-    assert normalized["section_status"]["config"] == "Not collected"
+    assert normalized["export_config"].endswith("_export-config.txt")
+    assert normalized["config"] == NOT_COLLECTED
 
 
-def test_parse_failed_and_empty_states():
+def test_parse_failures_and_not_collected():
     raw = {
         "info_no_node": '{}',
         "nodes": 'not-json',
-        "config": '{}',
-        "channels": '[]',
-        "module_config": '{',
+        "config": None,
+        "channels": None,
+        "module_config": None,
+        "export_config": None,
     }
     normalized = normalize_snapshot_payload(
         connection_type="serial",
@@ -37,8 +40,8 @@ def test_parse_failed_and_empty_states():
         raw=raw,
     )
 
-    assert normalized["section_status"]["local_info"] == "Empty"
-    assert normalized["section_status"]["nodes"] == "Parse failed"
-    assert normalized["section_status"]["config"] == "Empty"
-    assert normalized["section_status"]["channels"] == "Empty"
-    assert normalized["section_status"]["module_config"] == "Parse failed"
+    assert normalized["local_device_info"] == {}
+    assert normalized["nodes"] == []
+    assert "nodes: parse_failed" in normalized["parse_errors"][0]
+    assert normalized["channels"] == NOT_COLLECTED
+    assert normalized["module_config"] == NOT_COLLECTED
