@@ -44,6 +44,18 @@ def section_status(collected: bool, parse_error: str | None, value: Any) -> str:
     return "OK"
 
 
+def _reason_for_section(raw_value: str | None, parse_error: str | None, value: Any, *, supported: bool) -> str | None:
+    if not supported:
+        return "Not collected: current CLI flow does not collect this section in full local backup"
+    if raw_value is None:
+        return "Not collected: command not executed"
+    if parse_error:
+        return f"Parse failed: {parse_error}"
+    if _is_empty(value):
+        return "Collected but empty output"
+    return None
+
+
 def normalize_snapshot_payload(
     *,
     connection_type: str,
@@ -84,6 +96,7 @@ def normalize_snapshot_payload(
             "label": source.get("source_node_label"),
         },
         "local_info": local_info,
+        "device_info": local_info,
         "config": config,
         "channels": channels,
         "module_config": module_config,
@@ -96,13 +109,25 @@ def normalize_snapshot_payload(
             "module_config": raw.get("module_config") or "",
         },
         "parse_errors": parse_errors,
-        "warnings": [],
+        "warnings": [
+            "Config not collected: current CLI flow does not collect config in full local backup.",
+            "Channels not collected: current CLI flow does not collect channels in full local backup.",
+            "Module config not collected: current CLI flow does not collect module config in full local backup.",
+        ],
         "section_status": {
             "local_info": section_status(raw.get("info_no_node") is not None, info_err, local_info),
             "config": section_status(raw.get("config") is not None, config_err, config),
             "channels": section_status(raw.get("channels") is not None, channels_err, channels),
             "module_config": section_status(raw.get("module_config") is not None, module_err, module_config),
             "nodes": section_status(raw.get("nodes") is not None, nodes_err, nodes),
+        },
+        "section_reasons": {
+            "local_info": _reason_for_section(raw.get("info_no_node"), info_err, local_info, supported=True),
+            "device_info": _reason_for_section(raw.get("info_no_node"), info_err, local_info, supported=True),
+            "nodes": _reason_for_section(raw.get("nodes"), nodes_err, nodes, supported=True),
+            "config": _reason_for_section(raw.get("config"), config_err, config, supported=False),
+            "channels": _reason_for_section(raw.get("channels"), channels_err, channels, supported=False),
+            "module_config": _reason_for_section(raw.get("module_config"), module_err, module_config, supported=False),
         },
     }
     return normalized

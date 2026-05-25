@@ -94,7 +94,7 @@ def _build_logs(steps: dict[str, dict[str, Any]], normalized: dict[str, Any]) ->
         st = steps[key]
         h, t = _snippet(st.get("stdout") or "")
         eh, et = _snippet(st.get("stderr") or "")
-        logs.append({"section": sec, "command": " ".join(st.get("command") or []), "duration_ms": st.get("duration_ms"), "exit_code": st.get("exit_code"), "output_head": h, "output_tail": t, "stderr_head": eh, "stderr_tail": et, "parser_error": next((e for e in normalized.get("parse_errors", []) if sec in e or (sec=="local_info" and "info_no_node" in e)), None), "section_saved": normalized.get("section_status", {}).get(sec), "step_error": st.get("error")})
+        logs.append({"section": sec, "command": " ".join(st.get("command") or []), "duration_ms": st.get("duration_ms"), "exit_code": st.get("exit_code"), "output_head": h, "output_tail": t, "stderr_head": eh, "stderr_tail": et, "parser_error": next((e for e in normalized.get("parse_errors", []) if sec in e or (sec=="local_info" and "info_no_node" in e)), None), "section_saved": normalized.get("section_status", {}).get(sec), "section_reason": normalized.get("section_reasons", {}).get(sec), "step_error": st.get("error")})
     return logs
 
 
@@ -103,11 +103,17 @@ def run_local_backup(profile: ConnectionProfile) -> dict[str, Any]:
     steps = {
         "local_info_raw": _run_cli_step(profile, ["--info", "--no-node"]),
         "nodes_raw": _run_cli_step(profile, ["--nodes"]),
-        "config_raw": _run_cli_step(profile, ["--get", "owner"]),
-        "channels_raw": _run_cli_step(profile, ["--ch-show"]),
-        "module_config_raw": _run_cli_step(profile, ["--get", "module"]),
+        "config_raw": {"ok": False, "command": [], "exit_code": None, "duration_ms": 0, "stdout": "", "stderr": "", "error": "not_collected_in_current_cli_flow"},
+        "channels_raw": {"ok": False, "command": [], "exit_code": None, "duration_ms": 0, "stdout": "", "stderr": "", "error": "not_collected_in_current_cli_flow"},
+        "module_config_raw": {"ok": False, "command": [], "exit_code": None, "duration_ms": 0, "stdout": "", "stderr": "", "error": "not_collected_in_current_cli_flow"},
     }
-    raw = {k: (v.get("stdout") if v.get("ok") else None) for k, v in steps.items()}
+    raw = {
+        "local_info_raw": steps["local_info_raw"].get("stdout") if steps["local_info_raw"].get("ok") else None,
+        "nodes_raw": steps["nodes_raw"].get("stdout") if steps["nodes_raw"].get("ok") else None,
+        "config_raw": None,
+        "channels_raw": None,
+        "module_config_raw": None,
+    }
     local_info = {}
     if raw["local_info_raw"]:
         try: local_info = json.loads(raw["local_info_raw"])
@@ -127,11 +133,18 @@ def run_local_backup(profile: ConnectionProfile) -> dict[str, Any]:
     logs = _build_logs(steps, normalized)
     normalized["command_logs"] = logs
     metadata = {"timestamp": now, "connection": _safe_json(profile.__dict__), "command_logs": logs}
-    for filename, payload in {"local_info_raw.json": raw["local_info_raw"], "nodes_raw.json": raw["nodes_raw"], "config_raw.json": raw["config_raw"], "channels_raw.json": raw["channels_raw"], "module_config_raw.json": raw["module_config_raw"], "metadata.json": metadata, "normalized.json": normalized}.items():
+    for filename, payload in {
+        "local_info_stdout.json": raw["local_info_raw"],
+        "local_info_stderr.txt": steps["local_info_raw"].get("stderr") or "",
+        "nodes_stdout.json": raw["nodes_raw"],
+        "nodes_stderr.txt": steps["nodes_raw"].get("stderr") or "",
+        "metadata.json": metadata,
+        "normalized.json": normalized,
+    }.items():
         (backup_dir / filename).write_text(payload if isinstance(payload, str) else json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    useful = any(statuses.get(k) == "OK" for k in ("local_info", "nodes", "config", "channels", "module_config"))
+    useful = any(statuses.get(k) == "OK" for k in ("local_info", "nodes"))
     if not useful:
-        raise RuntimeError("No useful data collected. Step errors: " + "; ".join([f"{l['section']}:{l.get('step_error') or l.get('parser_error') or 'empty'}" for l in logs]))
+        raise RuntimeError("No useful data collected. Step errors: " + "; ".join([f"{l['section']}:{l.get('section_reason') or l.get('step_error') or l.get('parser_error') or 'empty'}" for l in logs]))
     return {"normalized": normalized, "backup_dir": str(backup_dir), "raw_path": str(backup_dir / "metadata.json"), "normalized_path": str(backup_dir / "normalized.json")}
 
 
