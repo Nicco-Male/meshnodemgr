@@ -116,7 +116,7 @@ def snapshot_review_page(snapshot_id: int) -> HTMLResponse:
 
 
 def _render_snapshot_review_html(snapshot_id: int, static_version: str) -> str:
-    return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Snapshot #{snapshot_id}</title><link rel='stylesheet' href='/static/styles.css?v={static_version}'></head><body><main class='container'><header class='header'><div><h1>Snapshot review #{snapshot_id}</h1><div class='muted'>Human verification required</div></div><a href='/' class='badge'>Back</a></header><section class='card'><div id='review-root'>Loading...</div><div id='review-status' class='status-box status-warning'>No action yet.</div></section></main><script>window.SNAPSHOT_ID={snapshot_id}</script><script src='/static/app.js?v={static_version}'></script></body></html>"""
+    return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Snapshot review</title><link rel='stylesheet' href='/static/styles.css?v={static_version}'></head><body><main class='container'><header class='header'><div><h1>Snapshot review</h1><div class='muted'>Human verification required</div></div><a href='/' class='badge'>Back</a></header><section class='card'><div id='review-root'>Loading...</div><div id='review-status' class='status-box status-warning'>No action yet.</div></section></main><script>window.SNAPSHOT_ID={snapshot_id}</script><script src='/static/app.js?v={static_version}'></script></body></html>"""
 
 @app.get('/api/status')
 def api_status():

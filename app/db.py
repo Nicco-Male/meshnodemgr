@@ -320,7 +320,12 @@ def list_snapshots() -> list[dict[str, Any]]:
             ORDER BY id DESC
             """
         ).fetchall()
-    return [dict(row) for row in rows]
+    snapshots = [dict(row) for row in rows]
+    ordered_ids = [s["id"] for s in sorted(snapshots, key=lambda item: item["id"])]
+    display_index_by_id = {snap_id: idx for idx, snap_id in enumerate(ordered_ids, start=1)}
+    for snapshot in snapshots:
+        snapshot["display_index"] = display_index_by_id.get(snapshot["id"], 0)
+    return snapshots
 
 
 def get_snapshot(snapshot_id: int) -> dict[str, Any] | None:
@@ -336,7 +341,20 @@ def get_snapshot(snapshot_id: int) -> dict[str, Any] | None:
             """,
             (snapshot_id,),
         ).fetchone()
-    return dict(row) if row else None
+    if not row:
+        return None
+    snapshot = dict(row)
+    with sqlite3.connect(DB_PATH) as conn:
+        count_row = conn.execute(
+            """
+            SELECT COUNT(*) AS display_index
+            FROM snapshots
+            WHERE id <= ?
+            """,
+            (snapshot_id,),
+        ).fetchone()
+    snapshot["display_index"] = int(count_row[0] or 0) if count_row else 0
+    return snapshot
 
 
 def verify_snapshot(snapshot_id: int) -> bool:
